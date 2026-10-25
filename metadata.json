@@ -1,0 +1,6 @@
+{
+  "name": "Indian Dental Clinic",
+  "description": "Professional dental care clinic website in Chhindwara, MP with AI assistant, real-time voice consultations, appointment bookings, and staff management.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

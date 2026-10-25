@@ -1,0 +1,99 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Default deny all access
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedAdmin() {
+      return isSignedIn() && (
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid)) ||
+        (request.auth.token.email != null && request.auth.token.email.lower() == 'zrrnikhilsahu@gmail.com')
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Validation for Appointment creation
+    function isValidAppointment(data) {
+      return data.keys().hasAll(['patientName', 'mobileNumber', 'preferredDate', 'consentGranted', 'status']) &&
+        data.keys().hasOnly(['id', 'patientName', 'mobileNumber', 'preferredDate', 'preferredTime', 'reason', 'consentGranted', 'status', 'notes', 'createdAt', 'updatedAt']) &&
+        data.patientName is string && data.patientName.size() >= 2 && data.patientName.size() <= 100 &&
+        data.mobileNumber is string && data.mobileNumber.size() >= 10 && data.mobileNumber.size() <= 15 &&
+        data.preferredDate is string && data.preferredDate.size() <= 30 &&
+        data.consentGranted is bool &&
+        data.status is string &&
+        (!('preferredTime' in data) || (data.preferredTime is string && data.preferredTime.size() <= 30)) &&
+        (!('reason' in data) || (data.reason is string && data.reason.size() <= 500)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 50)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 50));
+    }
+
+    // Validation for Conversation record
+    function isValidConversation(data) {
+      return data.keys().hasAll(['sessionType', 'consentGranted', 'followUpStatus']) &&
+        data.keys().hasOnly(['id', 'sessionType', 'patientName', 'mobileNumber', 'transcript', 'summary', 'enquiryCategory', 'consentGranted', 'consentVersion', 'followUpStatus', 'callDuration', 'language', 'notes', 'createdAt', 'updatedAt']) &&
+        (data.sessionType == 'Chat' || data.sessionType == 'Voice Call') &&
+        data.consentGranted is bool &&
+        data.followUpStatus is string &&
+        (!('patientName' in data) || (data.patientName is string && data.patientName.size() <= 100)) &&
+        (!('mobileNumber' in data) || (data.mobileNumber is string && data.mobileNumber.size() <= 25)) &&
+        (!('transcript' in data) || (data.transcript is string && data.transcript.size() <= 50000)) &&
+        (!('summary' in data) || (data.summary is string && data.summary.size() <= 2000)) &&
+        (!('enquiryCategory' in data) || (data.enquiryCategory is string && data.enquiryCategory.size() <= 100)) &&
+        (!('consentVersion' in data) || (data.consentVersion is string && data.consentVersion.size() <= 50)) &&
+        (!('callDuration' in data) || (data.callDuration is string && data.callDuration.size() <= 50)) &&
+        (!('language' in data) || (data.language is string && data.language.size() <= 20)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 1000)) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 50)) &&
+        (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 50));
+    }
+
+    // Appointments collection
+    match /appointments/{appointmentId} {
+      allow get, list: if isVerifiedAdmin();
+      allow create: if isValidId(appointmentId) && isValidAppointment(incoming()) && incoming().status == 'new';
+      allow update: if isVerifiedAdmin() && isValidAppointment(incoming());
+      allow delete: if isVerifiedAdmin();
+    }
+
+    // Conversations collection
+    match /conversations/{conversationId} {
+      allow get, list: if isVerifiedAdmin();
+      allow create: if isValidId(conversationId) && isValidConversation(incoming());
+      allow update: if isVerifiedAdmin() && isValidConversation(incoming());
+      allow delete: if isVerifiedAdmin();
+    }
+
+    // Clinic settings
+    match /clinicSettings/{settingId} {
+      allow get, list: if true;
+      allow create, update, delete: if isVerifiedAdmin();
+    }
+
+    // Admin users list
+    match /admins/{adminId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isVerifiedAdmin();
+    }
+  }
+}

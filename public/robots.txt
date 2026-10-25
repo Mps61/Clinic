@@ -1,0 +1,8 @@
+# robots.txt for Indian Dental Clinic Chhindwara
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /api/
+
+# Sitemap location
+Sitemap: https://indiandentalclinic.in/sitemap.xml

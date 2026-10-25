@@ -1,0 +1,100 @@
+{
+  "entities": {
+    "Appointment": {
+      "title": "Appointment",
+      "description": "Patient appointment booking enquiry for Indian Dental Clinic",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "patientName": { "type": "string", "minLength": 2, "maxLength": 100 },
+        "mobileNumber": { "type": "string", "pattern": "^[6-9][0-9]{9}$" },
+        "preferredDate": { "type": "string", "maxLength": 20 },
+        "preferredTime": { "type": "string", "maxLength": 20 },
+        "reason": { "type": "string", "maxLength": 500 },
+        "consentGranted": { "type": "boolean" },
+        "status": {
+          "type": "string",
+          "enum": ["new", "contacted", "scheduled", "completed", "cancelled"]
+        },
+        "notes": { "type": "string", "maxLength": 1000 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["patientName", "mobileNumber", "preferredDate", "consentGranted", "status"]
+    },
+    "Conversation": {
+      "title": "Conversation",
+      "description": "AI Dental Assistant Chat or Voice Call session record with patient consent",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "sessionType": { "type": "string", "enum": ["Chat", "Voice Call"] },
+        "patientName": { "type": "string", "maxLength": 100 },
+        "mobileNumber": { "type": "string", "maxLength": 20 },
+        "transcript": { "type": "string", "maxLength": 50000 },
+        "summary": { "type": "string", "maxLength": 2000 },
+        "enquiryCategory": { "type": "string", "maxLength": 100 },
+        "consentGranted": { "type": "boolean" },
+        "consentVersion": { "type": "string", "maxLength": 50 },
+        "followUpStatus": {
+          "type": "string",
+          "enum": ["new", "contacted", "appointment_requested", "completed", "closed"]
+        },
+        "notes": { "type": "string", "maxLength": 1000 },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["sessionType", "consentGranted", "followUpStatus"]
+    },
+    "ClinicSettings": {
+      "title": "ClinicSettings",
+      "description": "Configurable clinic settings including verified doctor details and contact information",
+      "type": "object",
+      "properties": {
+        "clinicName": { "type": "string", "maxLength": 150 },
+        "address": { "type": "string", "maxLength": 300 },
+        "mapsUrl": { "type": "string", "maxLength": 500 },
+        "phoneNumber": { "type": "string", "maxLength": 30 },
+        "whatsappNumber": { "type": "string", "maxLength": 30 },
+        "doctorName": { "type": "string", "maxLength": 100 },
+        "doctorQualifications": { "type": "string", "maxLength": 150 },
+        "doctorRegistration": { "type": "string", "maxLength": 100 },
+        "doctorBio": { "type": "string", "maxLength": 1000 },
+        "openingHours": { "type": "string", "maxLength": 200 },
+        "services": { "type": "string", "maxLength": 2000 },
+        "emergencyNotice": { "type": "string", "maxLength": 500 },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["clinicName", "address", "mapsUrl"]
+    },
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Authorized staff or administrator for clinic dashboard",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "maxLength": 150 },
+        "role": { "type": "string", "enum": ["admin", "staff"] },
+        "addedAt": { "type": "string" }
+      },
+      "required": ["email", "role"]
+    }
+  },
+  "firestore": {
+    "/appointments/{appointmentId}": {
+      "schema": "Appointment",
+      "description": "Patient appointment requests submitted via the website"
+    },
+    "/conversations/{conversationId}": {
+      "schema": "Conversation",
+      "description": "Chat and Voice Call transcripts recorded with patient consent"
+    },
+    "/clinicSettings/{settingId}": {
+      "schema": "ClinicSettings",
+      "description": "Public clinic configuration settings editable by admin"
+    },
+    "/admins/{adminId}": {
+      "schema": "AdminUser",
+      "description": "Authorized clinic staff administrator list"
+    }
+  }
+}
