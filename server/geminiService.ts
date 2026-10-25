@@ -114,7 +114,14 @@ export async function generateDentalChatResponse(
   }
 
   const client = getGeminiClient();
-  const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
+  const candidateModels = [
+    'gemini-3.5-flash',
+    'gemini-3.5-flash-lite',
+    'gemini-3.6-flash',
+    'gemini-flash-lite-latest',
+    'gemini-3.8-flash',
+    'gemini-3.1-flash-lite',
+  ];
   let lastError: any = null;
 
   for (const model of candidateModels) {
@@ -125,7 +132,7 @@ export async function generateDentalChatResponse(
         config: {
           systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
           temperature: 0.6,
-          maxOutputTokens: 300,
+          maxOutputTokens: 600,
         },
       });
 
@@ -154,39 +161,42 @@ export async function generateDentalSpeech(
   text: string,
   _language: 'en' | 'hi' = 'en'
 ): Promise<string | null> {
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: text,
-              speechMetadata: {
-                style: 'Calm, clear, and reassuring healthcare professional',
+  const ttsModels = ['gemini-3.8-flash-lite-tts', 'gemini-2.5-flash-preview-tts', 'gemini-3.8-flash-tts'];
+  for (const model of ttsModels) {
+    try {
+      const response = await ai.models.generateContent({
+        model: model,
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: text,
+                speechMetadata: {
+                  style: 'Calm, clear, and reassuring healthcare professional',
+                },
               },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Aoede' },
             },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Aoede' },
           },
         },
-      },
-    });
+      });
 
-    const base64Audio =
-      response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    return base64Audio || null;
-  } catch (error) {
-    console.error('Error generating speech with Gemini TTS:', error);
-    return null;
+      const base64Audio =
+        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (base64Audio) return base64Audio;
+    } catch (error) {
+      console.warn(`TTS attempt with ${model} failed:`, error);
+    }
   }
+  return null;
 }
 
 /**

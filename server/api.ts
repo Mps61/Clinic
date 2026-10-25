@@ -57,18 +57,23 @@ apiApp.post('/chat', async (req, res) => {
  */
 apiApp.post('/voice/turn', async (req, res) => {
   try {
-    const { userText, history = [], language = 'en' } = req.body;
+    const { userText, history = [], language = 'en', greetingOnly } = req.body;
 
     if (!userText || typeof userText !== 'string') {
       return res.status(400).json({ error: 'userText is required.' });
     }
 
-    const messages: ChatMessage[] = [
-      ...history,
-      { role: 'user', text: userText },
-    ];
+    let replyText = '';
+    if (greetingOnly) {
+      replyText = userText;
+    } else {
+      const messages: ChatMessage[] = [
+        ...history,
+        { role: 'user', text: userText },
+      ];
+      replyText = await generateDentalChatResponse(messages, language);
+    }
 
-    const replyText = await generateDentalChatResponse(messages, language);
     const audioBase64 = await generateDentalSpeech(replyText, language);
 
     return res.json({

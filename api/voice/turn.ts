@@ -55,7 +55,7 @@ export default async function handler(
 
   try {
     const body = await parseJsonBody(req);
-    const { userText, history = [], language = 'en' } = body;
+    const { userText, history = [], language = 'en', greetingOnly } = body;
 
     if (!userText || typeof userText !== 'string') {
       res.statusCode = 400;
@@ -64,12 +64,17 @@ export default async function handler(
       return;
     }
 
-    const messages: ChatMessage[] = [
-      ...history,
-      { role: 'user', text: userText },
-    ];
+    let replyText = '';
+    if (greetingOnly) {
+      replyText = userText;
+    } else {
+      const messages: ChatMessage[] = [
+        ...history,
+        { role: 'user', text: userText },
+      ];
+      replyText = await generateDentalChatResponse(messages, language);
+    }
 
-    const replyText = await generateDentalChatResponse(messages, language);
     const audioBase64 = await generateDentalSpeech(replyText, language);
 
     res.statusCode = 200;

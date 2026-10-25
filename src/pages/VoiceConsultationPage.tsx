@@ -95,6 +95,8 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const lastAudioLevelUpdateRef = useRef<number>(0);
   const asstTextBufferRef = useRef<string>('');
+  const speechRecogRef = useRef<any>(null);
+  const activeAudioElementRef = useRef<HTMLAudioElement | null>(null);
 
   // Validation
   const isNameValid = fullName.trim().length >= 2;
@@ -337,7 +339,58 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
       processor.connect(silenceGain);
       silenceGain.connect(inputCtx.destination);
 
+      // 5. Start browser SpeechRecognition so patient voice is continuously recognized and answered
+      const SpeechRecognitionClass =
+        (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (SpeechRecognitionClass) {
+        try {
+          const recog = new SpeechRecognitionClass();
+          recog.continuous = true;
+          recog.interimResults = true;
+          recog.lang = language === 'hi' ? 'hi-IN' : 'en-IN';
+
+          recog.onresult = (event: any) => {
+            if (!isCallActiveRef.current || isMutedRef.current) return;
+            let interim = '';
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+              if (event.results[i].isFinal) {
+                const finalSentence = event.results[i][0].transcript.trim();
+                if (finalSentence) {
+                  handleUserSpeechCompleted(finalSentence);
+                }
+              } else {
+                interim += event.results[i][0].transcript;
+              }
+            }
+            if (interim.trim()) {
+              setCurrentSubtitle(interim.trim());
+              setVoiceStatus('listening');
+            }
+          };
+
+          recog.onerror = (e: any) => {
+            console.warn('Speech recognition notice:', e?.error || e);
+          };
+
+          recog.onend = () => {
+            if (isCallActiveRef.current && !isMutedRef.current) {
+              try {
+                recog.start();
+              } catch {}
+            }
+          };
+
+          recog.start();
+          speechRecogRef.current = recog;
+        } catch (e) {
+          console.warn('Speech recognition startup notice:', e);
+        }
+      }
+
       setVoiceStatus('listening');
+
+      // Speak welcome greeting immediately out loud
+      playGreetingAudio(welcome);
     } catch (err) {
       console.error('Microphone error:', err);
       setPreCallError('Microphone permission is required to speak with our AI dental assistant. Please allow microphone access.');
@@ -345,7 +398,72 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
   };
 
   /**
-   * Process user speech turn into transcript (from topic keypad or text input)
+   * Speak greeting audio out loud using TTS or browser SpeechSynthesis
+   */
+  const playGreetingAudio = async (greetingText: string) => {
+    try {
+      const res = await fetch('/api/voice/turn', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userText: greetingText,
+          language: language,
+          greetingOnly: true,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        if (data.audioBase64 && !isSpeakerMuted && isCallActiveRef.current) {
+          const audio = new Audio(`data:audio/wav;base64,${data.audioBase64}`);
+          activeAudioElementRef.current = audio;
+          setVoiceStatus('speaking');
+          audio.onended = () => {
+            if (isCallActiveRef.current) setVoiceStatus('listening');
+          };
+          audio.play().catch(() => {
+            playSpeechSynthesisFallback(greetingText);
+          });
+          return;
+        }
+      }
+    } catch {}
+    if (isCallActiveRef.current && !isSpeakerMuted) {
+      playSpeechSynthesisFallback(greetingText);
+    }
+  };
+
+  /**
+   * Browser SpeechSynthesis fallback if Gemini TTS audio is not playable
+   */
+  const playSpeechSynthesisFallback = (text: string) => {
+    if (typeof window === 'undefined' || !('speechSynthesis' in window) || isSpeakerMuted) {
+      setTimeout(() => {
+        if (isCallActiveRef.current) setVoiceStatus('listening');
+      }, 2000);
+      return;
+    }
+    try {
+      window.speechSynthesis.cancel();
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.lang = language === 'hi' ? 'hi-IN' : 'en-IN';
+      utter.rate = 1.0;
+      utter.onend = () => {
+        if (isCallActiveRef.current) setVoiceStatus('listening');
+      };
+      utter.onerror = () => {
+        if (isCallActiveRef.current) setVoiceStatus('listening');
+      };
+      setVoiceStatus('speaking');
+      window.speechSynthesis.speak(utter);
+    } catch {
+      setTimeout(() => {
+        if (isCallActiveRef.current) setVoiceStatus('listening');
+      }, 2000);
+    }
+  };
+
+  /**
+   * Process user speech turn into transcript (from topic keypad or text input or SpeechRecognition)
    */
   const handleUserSpeechCompleted = (spokenSentence: string) => {
     if (!isCallActiveRef.current || !spokenSentence.trim()) return;
@@ -364,14 +482,23 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
     setVoiceStatus('processing');
     asstTextBufferRef.current = '';
 
-    // Send user prompt over WebSocket
+    // Stop any currently playing audio so new reply takes over
+    if (activeAudioElementRef.current) {
+      try {
+        activeAudioElementRef.current.pause();
+      } catch {}
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+
+    // Send user prompt over WebSocket if connected, otherwise use HTTP endpoint
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'text',
         text: spokenSentence.trim(),
       }));
     } else {
-      // Fallback via HTTP /api/voice/turn if WebSocket reconnecting
       handleHttpVoiceFallback(spokenSentence.trim());
     }
   };
@@ -413,10 +540,19 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
 
       if (audioBase64 && !isSpeakerMuted) {
         const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
-        audio.onended = () => setVoiceStatus('listening');
-        audio.play().catch(() => setVoiceStatus('listening'));
+        activeAudioElementRef.current = audio;
+        audio.onended = () => {
+          if (isCallActiveRef.current) setVoiceStatus('listening');
+        };
+        audio.play().catch(() => {
+          playSpeechSynthesisFallback(replyText);
+        });
+      } else if (!isSpeakerMuted) {
+        playSpeechSynthesisFallback(replyText);
       } else {
-        setTimeout(() => setVoiceStatus('listening'), 2000);
+        setTimeout(() => {
+          if (isCallActiveRef.current) setVoiceStatus('listening');
+        }, 2000);
       }
     } catch (e) {
       console.warn('HTTP fallback notice:', e);
@@ -429,6 +565,25 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
    */
   const handleEndCall = async () => {
     isCallActiveRef.current = false;
+
+    // Stop speech recognition
+    if (speechRecogRef.current) {
+      try {
+        speechRecogRef.current.stop();
+      } catch {}
+      speechRecogRef.current = null;
+    }
+
+    // Stop active audio
+    if (activeAudioElementRef.current) {
+      try {
+        activeAudioElementRef.current.pause();
+      } catch {}
+      activeAudioElementRef.current = null;
+    }
+    if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
 
     // Close WebSocket
     if (wsRef.current) {
