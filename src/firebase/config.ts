@@ -29,11 +29,22 @@ export interface FirestoreErrorInfo {
   };
 }
 
+// Support both Vercel environment variables and bundled firebase-applet-config.json
+export const activeFirebaseConfig = {
+  projectId: (import.meta as any).env?.VITE_FIREBASE_PROJECT_ID || firebaseConfig.projectId,
+  appId: (import.meta as any).env?.VITE_FIREBASE_APP_ID || firebaseConfig.appId,
+  apiKey: (import.meta as any).env?.VITE_FIREBASE_API_KEY || firebaseConfig.apiKey,
+  authDomain: (import.meta as any).env?.VITE_FIREBASE_AUTH_DOMAIN || firebaseConfig.authDomain,
+  firestoreDatabaseId: (import.meta as any).env?.VITE_FIREBASE_DATABASE_ID || (firebaseConfig as any).firestoreDatabaseId,
+  storageBucket: (import.meta as any).env?.VITE_FIREBASE_STORAGE_BUCKET || firebaseConfig.storageBucket,
+  messagingSenderId: (import.meta as any).env?.VITE_FIREBASE_MESSAGING_SENDER_ID || firebaseConfig.messagingSenderId,
+};
+
 // Initialize Firebase App
-const app = initializeApp(firebaseConfig);
+const app = initializeApp(activeFirebaseConfig);
 
 // CRITICAL: The app will break without firestoreDatabaseId specified
-export const db = getFirestore(app, (firebaseConfig as { firestoreDatabaseId: string }).firestoreDatabaseId);
+export const db = getFirestore(app, activeFirebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 
 // Error handler per Firebase Skill instructions

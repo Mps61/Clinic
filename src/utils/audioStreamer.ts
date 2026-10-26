@@ -1,7 +1,7 @@
 /**
- * PCM Audio Helper for Gemini Live API Real-Time Voice
+ * PCM Audio Helper for Gemini Live API Real-Time Voice & Gemini TTS
  * Input: 16kHz 16-bit mono PCM
- * Output: 24kHz 16-bit mono PCM playback with gapless scheduling
+ * Output: 24kHz 16-bit mono PCM playback and WAV decoding with gapless scheduling
  */
 
 export function float32ToInt16Base64(float32Array: Float32Array): string {
@@ -32,11 +32,9 @@ export class GaplessPCMPlayer {
   private audioCtx: AudioContext | null = null;
   private nextStartTime: number = 0;
   private activeSources: AudioBufferSourceNode[] = [];
+  private currentHtmlAudio: HTMLAudioElement | null = null;
   public onAudioLevel?: (level: number) => void;
-
-  constructor() {
-    // 24kHz output for Gemini Live
-  }
+  public isMuted: boolean = false;
 
   public init() {
     if (!this.audioCtx || this.audioCtx.state === 'closed') {
@@ -50,6 +48,7 @@ export class GaplessPCMPlayer {
   }
 
   public playChunk(base64Audio: string) {
+    if (this.isMuted) return;
     if (!this.audioCtx) this.init();
     if (!this.audioCtx) return;
 
@@ -92,6 +91,56 @@ export class GaplessPCMPlayer {
     }
   }
 
+  /**
+   * Play base64 WAV audio (returned by Gemini TTS)
+   */
+  public async playWav(base64Wav: string): Promise<void> {
+    if (this.isMuted) return;
+    this.interrupt();
+
+    return new Promise<void>((resolve) => {
+      try {
+        const audio = new Audio(`data:audio/wav;base64,${base64Wav}`);
+        this.currentHtmlAudio = audio;
+
+        // Drive visualizer simulation while playing
+        let animId: number | null = null;
+        const pulse = () => {
+          if (!audio.paused && !audio.ended && this.onAudioLevel) {
+            // Simulated speech waveform
+            const simulatedLevel = 25 + Math.random() * 40;
+            this.onAudioLevel(simulatedLevel);
+            animId = window.requestAnimationFrame(pulse);
+          } else if (this.onAudioLevel) {
+            this.onAudioLevel(0);
+          }
+        };
+
+        audio.onplay = () => {
+          animId = window.requestAnimationFrame(pulse);
+        };
+
+        const cleanup = () => {
+          if (animId) window.cancelAnimationFrame(animId);
+          if (this.onAudioLevel) this.onAudioLevel(0);
+          this.currentHtmlAudio = null;
+          resolve();
+        };
+
+        audio.onended = cleanup;
+        audio.onerror = cleanup;
+
+        audio.play().catch((playErr) => {
+          console.warn('HTMLAudio play failed:', playErr);
+          cleanup();
+        });
+      } catch (err) {
+        console.warn('Error initiating WAV playback:', err);
+        resolve();
+      }
+    });
+  }
+
   public interrupt() {
     for (const source of this.activeSources) {
       try {
@@ -99,8 +148,20 @@ export class GaplessPCMPlayer {
       } catch {}
     }
     this.activeSources = [];
+
+    if (this.currentHtmlAudio) {
+      try {
+        this.currentHtmlAudio.pause();
+        this.currentHtmlAudio.currentTime = 0;
+      } catch {}
+      this.currentHtmlAudio = null;
+    }
+
     if (this.audioCtx) {
       this.nextStartTime = this.audioCtx.currentTime;
+    }
+    if (this.onAudioLevel) {
+      this.onAudioLevel(0);
     }
   }
 

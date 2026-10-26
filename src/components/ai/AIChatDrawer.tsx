@@ -98,21 +98,47 @@ export const AIChatDrawer: React.FC<AIChatDrawerProps> = ({
       });
 
       if (!response.ok) {
-        throw new Error('Server responded with an error');
+        let errMessage = 'Server responded with an error';
+        try {
+          const errData = await response.json();
+          if (errData?.code === 'MISSING_API_KEY' || errData?.error?.includes('GEMINI_API_KEY')) {
+            errMessage = '⚠️ Configuration required: GEMINI_API_KEY is not set in your Vercel project environment variables. Please add GEMINI_API_KEY in Vercel settings and redeploy.';
+          } else if (errData?.error) {
+            errMessage = errData.error;
+          }
+        } catch {
+          // If response body was HTML (e.g. 404 from missing serverless rewrite)
+          if (response.status === 404) {
+            errMessage = '⚠️ API route not reachable (HTTP 404). Please ensure vercel.json rewrite or server API routes are deployed.';
+          } else {
+            errMessage = `Server error (${response.status}). Please try again in a few moments.`;
+          }
+        }
+        throw new Error(errMessage);
       }
 
       const data = await response.json();
       const botMsg: Message = {
         role: 'model',
-        text: data.reply,
+        text: data.reply || 'Namaste! How may I assist you with your dental care today?',
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, botMsg]);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Chat error:', error);
+      const isMissingKey = error?.message?.includes('GEMINI_API_KEY') || error?.message?.includes('Configuration required');
+      const isRouteError = error?.message?.includes('404');
+      
+      let displayText = 'I apologize, but I encountered a connection issue. Please feel free to ask again or contact our clinic directly.';
+      if (isMissingKey || isRouteError) {
+        displayText = error.message;
+      } else if (error instanceof Error && error.message) {
+        displayText = `Notice: ${error.message}`;
+      }
+
       const errorMsg: Message = {
         role: 'model',
-        text: 'I apologize, but I encountered a connection issue. Please feel free to ask again or contact our clinic directly.',
+        text: displayText,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMsg]);

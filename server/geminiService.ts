@@ -3,9 +3,42 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Create server-side Gemini client per skill guidelines
+/**
+ * Safely resolve Gemini API Key from environment variables.
+ * Supports GEMINI_API_KEY (primary), GOOGLE_API_KEY, and GOOGLE_GENAI_API_KEY (common Vercel names).
+ */
+export function getGeminiApiKey(): string | undefined {
+  return (
+    process.env.GEMINI_API_KEY ||
+    process.env.GOOGLE_API_KEY ||
+    process.env.GOOGLE_GENAI_API_KEY
+  );
+}
+
+/**
+ * Returns a configured GoogleGenAI instance.
+ * Instantiated dynamically to ensure runtime environment variables on Vercel are read.
+ */
+export function getGeminiClient(): GoogleGenAI {
+  const apiKey = getGeminiApiKey();
+  if (!apiKey) {
+    throw new Error(
+      'GEMINI_API_KEY is not configured on the server. Please add GEMINI_API_KEY to your Vercel project environment variables.'
+    );
+  }
+  return new GoogleGenAI({
+    apiKey,
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+}
+
+// Export default instance for backward compatibility
 export const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY || '',
+  apiKey: getGeminiApiKey() || 'UNCONFIGURED_KEY',
   httpOptions: {
     headers: {
       'User-Agent': 'aistudio-build',
@@ -54,12 +87,14 @@ export interface ChatMessage {
 }
 
 /**
- * Generate fast chat response using gemini-flash-latest with token capping for near-instant latency
+ * Generate dental chat response using gemini-3.8-flash with fallback to gemini-flash-latest
  */
 export async function generateDentalChatResponse(
   messages: ChatMessage[],
   userLanguage?: 'en' | 'hi'
 ): Promise<string> {
+  const client = getGeminiClient();
+
   const languagePrompt =
     userLanguage === 'hi'
       ? 'कृपया हिंदी में उत्तर दें (सरल और विनम्र भाषा में, 2-3 छोटे वाक्यों में)।'
@@ -80,37 +115,66 @@ export async function generateDentalChatResponse(
     }
   }
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-flash-latest',
-    contents: contents,
-    config: {
-      systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
-      temperature: 0.6,
-      maxOutputTokens: 300,
-    },
-  });
+  // Multi-model resilience cascade:
+  // 1. gemini-3.8-flash (primary)
+  // 2. gemini-3.1-flash-lite (fast, high capacity pool)
+  // 3. gemini-flash-latest
+  const candidateModels = ['gemini-3.8-flash', 'gemini-3.1-flash-lite', 'gemini-flash-latest'];
 
-  return response.text || 'I apologize, but I could not generate a response at this moment. Please try again.';
+  for (const modelName of candidateModels) {
+    try {
+      const response = await client.models.generateContent({
+        model: modelName,
+        contents: contents,
+        config: {
+          systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
+          temperature: 0.6,
+          maxOutputTokens: 300,
+        },
+      });
+
+      if (response.text && response.text.trim()) {
+        return response.text.trim();
+      }
+    } catch (modelErr: any) {
+      console.warn(`[Gemini Chat] ${modelName} notice:`, modelErr?.message || modelErr);
+      // Wait 300ms before trying the next model
+      await new Promise((r) => setTimeout(r, 300));
+    }
+  }
+
+  // Graceful fallback response when upstream model demand is universally spiked
+  return userLanguage === 'hi'
+    ? 'नमस्ते! इंडियन डेंटल क्लिनिक, छिंदवाड़ा में आपका स्वागत है। हम रूट कैनाल, दांतों की सफाई, फिलिंग और ब्रेसेस की सुविधा प्रदान करते हैं। आप वेबसाइट पर अपॉइंटमेंट फॉर्म भरकर सीधे डॉक्टर से परामर्श प्राप्त कर सकते हैं।'
+    : 'Namaste! Welcome to Indian Dental Clinic in Chhindwara. We are located at Shop No. 43, Jail Bagicha Road, Rautha Wada. We provide root canal treatment, ultrasonic teeth cleaning, composite fillings, and dental checkups. You can submit an appointment request directly using our booking form on this website.';
 }
 
 /**
  * Generate Speech audio using gemini-3.8-flash-lite-tts
- * Configured with voice "Aoede" as specified
- * Returns base64 WAV audio
+ * Configured with voice "Kore" (reassuring, clear tone)
+ * Returns base64 WAV audio (24kHz mono 16-bit WAV)
  */
 export async function generateDentalSpeech(
   text: string,
   _language: 'en' | 'hi' = 'en'
 ): Promise<string | null> {
   try {
-    const response = await ai.models.generateContent({
+    const client = getGeminiClient();
+
+    // Clean text to keep TTS smooth and natural
+    const cleanText = text
+      .replace(/[*_#`]/g, '')
+      .replace(/https?:\/\/\S+/g, 'link on our website')
+      .slice(0, 500);
+
+    const response = await client.models.generateContent({
       model: 'gemini-3.8-flash-lite-tts',
       contents: [
         {
           role: 'user',
           parts: [
             {
-              text: text,
+              text: cleanText,
               speechMetadata: {
                 style: 'Calm, clear, and reassuring healthcare professional',
               },
@@ -122,7 +186,7 @@ export async function generateDentalSpeech(
         responseModalities: ['AUDIO'],
         speechConfig: {
           voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Aoede' },
+            prebuiltVoiceConfig: { voiceName: 'Kore' },
           },
         },
       },
@@ -132,7 +196,7 @@ export async function generateDentalSpeech(
       response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
     return base64Audio || null;
   } catch (error) {
-    console.error('Error generating speech with Gemini TTS:', error);
+    console.error('[Gemini Speech] Error generating speech with gemini-3.8-flash-lite-tts:', error instanceof Error ? error.message : error);
     return null;
   }
 }
@@ -145,6 +209,8 @@ export async function transcribeAudio(
   mimeType: string = 'audio/webm'
 ): Promise<string> {
   try {
+    const client = getGeminiClient();
+
     const audioPart = {
       inlineData: {
         mimeType: mimeType,
@@ -152,7 +218,7 @@ export async function transcribeAudio(
       },
     };
 
-    const response = await ai.models.generateContent({
+    const response = await client.models.generateContent({
       model: 'gemini-3.5-transcribe',
       contents: {
         parts: [
@@ -166,7 +232,7 @@ export async function transcribeAudio(
 
     return response.text?.trim() || '';
   } catch (error) {
-    console.error('Error transcribing audio with gemini-3.5-transcribe:', error);
+    console.error('[Gemini Transcribe] Error transcribing audio:', error instanceof Error ? error.message : error);
     return '';
   }
 }
@@ -180,6 +246,8 @@ export async function summarizeConversation(transcript: string): Promise<{
   keyPoints: string[];
 }> {
   try {
+    const client = getGeminiClient();
+
     const prompt = `Analyze this dental clinic patient enquiry / conversation transcript:
 """
 ${transcript.slice(0, 8000)}
@@ -201,16 +269,29 @@ Return your response in this exact JSON format:
   ]
 }`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-flash-latest',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        maxOutputTokens: 250,
-      },
-    });
-
-    const raw = response.text?.trim() || '{}';
+    let raw = '{}';
+    try {
+      const response = await client.models.generateContent({
+        model: 'gemini-3.8-flash',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          maxOutputTokens: 250,
+        },
+      });
+      raw = response.text?.trim() || '{}';
+    } catch {
+      // Fallback to gemini-3.1-flash-lite
+      const response = await client.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: prompt,
+        config: {
+          responseMimeType: 'application/json',
+          maxOutputTokens: 250,
+        },
+      });
+      raw = response.text?.trim() || '{}';
+    }
     const parsed = JSON.parse(raw);
     return {
       summary: parsed.summary || 'General dental care enquiry.',
@@ -220,18 +301,18 @@ Return your response in this exact JSON format:
         : [
             'Inquired about dental care services',
             'Discussed symptoms and general oral health advice',
-            'Requested clinic consultation details'
+            'Requested clinic consultation details',
           ],
     };
   } catch (error) {
-    console.error('Error summarizing conversation:', error);
+    console.error('[Gemini Summary] Error summarizing conversation:', error instanceof Error ? error.message : error);
     return {
       summary: 'Patient conversation recorded with consent.',
       enquiryCategory: 'General Consultation',
       keyPoints: [
         'Inquired about dental care services',
         'Discussed symptoms and oral health advice',
-        'Requested clinic consultation details'
+        'Requested clinic consultation details',
       ],
     };
   }
