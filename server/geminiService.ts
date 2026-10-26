@@ -3,38 +3,13 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Helper to get active API key from any supported environment variable
-export function getGeminiApiKey(): string {
-  return (
-    process.env.GEMINI_API_KEY ||
-    process.env.API_KEY ||
-    process.env.VITE_GEMINI_API_KEY ||
-    ''
-  );
-}
-
-// Create server-side Gemini client per skill guidelines with dynamic key lookup
-export function getGeminiClient(): GoogleGenAI {
-  const apiKey = getGeminiApiKey();
-  return new GoogleGenAI({
-    apiKey: apiKey,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
-      },
+// Create server-side Gemini client per skill guidelines
+export const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY || '',
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
     },
-  });
-}
-
-// Dynamic proxy for backwards compatibility with imports like: import { ai } from './geminiService'
-export const ai = new Proxy({} as GoogleGenAI, {
-  get(_target, prop) {
-    const client = getGeminiClient();
-    const val = (client as any)[prop];
-    if (typeof val === 'function') {
-      return val.bind(client);
-    }
-    return val;
   },
 });
 
@@ -85,14 +60,6 @@ export async function generateDentalChatResponse(
   messages: ChatMessage[],
   userLanguage?: 'en' | 'hi'
 ): Promise<string> {
-  const apiKey = getGeminiApiKey();
-  if (!apiKey) {
-    console.warn('GEMINI_API_KEY is not configured in environment variables.');
-    return userLanguage === 'hi'
-      ? 'नमस्ते! इंडियन डेंटल क्लीनिक में आपका स्वागत है (शॉप नं. 43, कॉम्प्लेक्स, जेल बगीचा रोड, रौथा वाड़ा, छिंदवाड़ा, म.प्र. 480001)। हमारे क्लीनिक में दांत दर्द, रूट कैनाल (RCT), दांतों की सफाई, तार/ब्रेसेस और कैपिंग की सुविधा उपलब्ध है। अपॉइंटमेंट बुक करने के लिए कृपया वेबसाइट पर "Book Appointment" फॉर्म भरें या क्लीनिक पर संपर्क करें।'
-      : 'Welcome to Indian Dental Clinic (Shop No. 43, Complex, Jail Bagicha Road, Rautha Wada, Chhindwara, MP 480001). We provide comprehensive dental care including Root Canal Treatment, Scaling, Tooth Fillings, Braces, and Extractions. To schedule your visit, please submit an appointment request on our website or visit our clinic.';
-  }
-
   const languagePrompt =
     userLanguage === 'hi'
       ? 'कृपया हिंदी में उत्तर दें (सरल और विनम्र भाषा में, 2-3 छोटे वाक्यों में)।'
@@ -113,43 +80,17 @@ export async function generateDentalChatResponse(
     }
   }
 
-  const client = getGeminiClient();
-  const candidateModels = [
-    'gemini-3.5-flash',
-    'gemini-3.5-flash-lite',
-    'gemini-3.6-flash',
-    'gemini-flash-lite-latest',
-    'gemini-3.8-flash',
-    'gemini-3.1-flash-lite',
-  ];
-  let lastError: any = null;
+  const response = await ai.models.generateContent({
+    model: 'gemini-flash-latest',
+    contents: contents,
+    config: {
+      systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
+      temperature: 0.6,
+      maxOutputTokens: 300,
+    },
+  });
 
-  for (const model of candidateModels) {
-    try {
-      const response = await client.models.generateContent({
-        model,
-        contents: contents,
-        config: {
-          systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
-          temperature: 0.6,
-          maxOutputTokens: 600,
-        },
-      });
-
-      if (response.text) {
-        return response.text;
-      }
-    } catch (err: any) {
-      lastError = err;
-      console.warn(`Model ${model} attempt failed:`, err?.message || err);
-      // Continue to next fallback model
-    }
-  }
-
-  console.error('All Gemini model attempts failed:', lastError);
-  return userLanguage === 'hi'
-    ? 'नमस्ते! इंडियन डेंटल क्लीनिक में आपका स्वागत है (शॉप नं. 43, जेल बगीचा रोड, रौथा वाड़ा, छिंदवाड़ा)। हमारे क्लीनिक में दांत दर्द, रूट कैनाल, सफाई और अन्य सभी दंत उपचार उपलब्ध हैं। डॉक्टर से परामर्श या अपॉइंटमेंट के लिए कृपया वेबसाइट पर "Book Appointment" फॉर्म भरें।'
-    : 'Welcome to Indian Dental Clinic (Shop No. 43, Complex, Jail Bagicha Road, Rautha Wada, Chhindwara, MP). We provide consultations, Root Canal Treatment, teeth cleaning, fillings, and braces. You can schedule an appointment using our online booking form.';
+  return response.text || 'I apologize, but I could not generate a response at this moment. Please try again.';
 }
 
 /**
@@ -161,42 +102,39 @@ export async function generateDentalSpeech(
   text: string,
   _language: 'en' | 'hi' = 'en'
 ): Promise<string | null> {
-  const ttsModels = ['gemini-3.8-flash-lite-tts', 'gemini-2.5-flash-preview-tts', 'gemini-3.8-flash-tts'];
-  for (const model of ttsModels) {
-    try {
-      const response = await ai.models.generateContent({
-        model: model,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: text,
-                speechMetadata: {
-                  style: 'Calm, clear, and reassuring healthcare professional',
-                },
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.8-flash-lite-tts',
+      contents: [
+        {
+          role: 'user',
+          parts: [
+            {
+              text: text,
+              speechMetadata: {
+                style: 'Calm, clear, and reassuring healthcare professional',
               },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Aoede' },
             },
+          ],
+        },
+      ],
+      config: {
+        responseModalities: ['AUDIO'],
+        speechConfig: {
+          voiceConfig: {
+            prebuiltVoiceConfig: { voiceName: 'Aoede' },
           },
         },
-      });
+      },
+    });
 
-      const base64Audio =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) return base64Audio;
-    } catch (error) {
-      console.warn(`TTS attempt with ${model} failed:`, error);
-    }
+    const base64Audio =
+      response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+    return base64Audio || null;
+  } catch (error) {
+    console.error('Error generating speech with Gemini TTS:', error);
+    return null;
   }
-  return null;
 }
 
 /**
@@ -242,19 +180,6 @@ export async function summarizeConversation(transcript: string): Promise<{
   keyPoints: string[];
 }> {
   try {
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) {
-      return {
-        summary: 'Dental clinic enquiry consultation recorded.',
-        enquiryCategory: 'General Consultation',
-        keyPoints: [
-          'Inquired about dental clinic services in Chhindwara',
-          'Discussed oral hygiene and treatment advice',
-          'Requested appointment information',
-        ],
-      };
-    }
-
     const prompt = `Analyze this dental clinic patient enquiry / conversation transcript:
 """
 ${transcript.slice(0, 8000)}

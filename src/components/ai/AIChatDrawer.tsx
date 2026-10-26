@@ -98,20 +98,7 @@ export const AIChatDrawer: React.FC<AIChatDrawerProps> = ({
       });
 
       if (!response.ok) {
-        let errData: any = null;
-        try {
-          errData = await response.json();
-        } catch {}
-        if (errData?.reply) {
-          const botMsg: Message = {
-            role: 'model',
-            text: errData.reply,
-            time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          };
-          setMessages((prev) => [...prev, botMsg]);
-          return;
-        }
-        throw new Error(errData?.error || 'Server responded with an error');
+        throw new Error('Server responded with an error');
       }
 
       const data = await response.json();
@@ -123,13 +110,9 @@ export const AIChatDrawer: React.FC<AIChatDrawerProps> = ({
       setMessages((prev) => [...prev, botMsg]);
     } catch (error) {
       console.error('Chat error:', error);
-      const fallbackNotice =
-        language === 'hi'
-          ? 'नमस्ते! इंडियन डेंटल क्लीनिक में आपका स्वागत है (शॉप नं. 43, कॉम्प्लेक्स, जेल बगीचा रोड, रौथा वाड़ा, छिंदवाड़ा, म.प्र.)। हम दांत दर्द, रूट कैनाल, दांतों की सफाई और ब्रेसेस में सहायता करते हैं। आप सीधे ऊपर "Book Appointment" पर क्लिक करके परामर्श अनुरोध सबमिट कर सकते हैं।'
-          : 'Welcome to Indian Dental Clinic (Shop No. 43, Complex, Jail Bagicha Road, Rautha Wada, Chhindwara, MP). We provide gentle care for toothache, root canal treatments, scaling, and braces. You can also request a consultation anytime via the "Book Appointment" button above.';
       const errorMsg: Message = {
         role: 'model',
-        text: fallbackNotice,
+        text: 'I apologize, but I encountered a connection issue. Please feel free to ask again or contact our clinic directly.',
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMsg]);

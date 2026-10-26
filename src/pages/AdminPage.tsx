@@ -16,7 +16,6 @@ import {
   ShieldAlert,
   UserCheck,
   AlertTriangle,
-  AlertCircle,
   RefreshCw,
   X,
   Save,
@@ -36,17 +35,7 @@ import {
 import { GbpSeoChecklist } from '../components/seo/GbpSeoChecklist';
 
 export const AdminPage: React.FC = () => {
-  const {
-    currentUser,
-    isAdmin,
-    loading: authLoading,
-    authError,
-    unauthorizedDomain,
-    clearAuthError,
-    loginWithGoogle,
-    logout,
-  } = useAuth();
-  const [copiedDomain, setCopiedDomain] = useState(false);
+  const { currentUser, isAdmin, loading: authLoading, loginWithGoogle, logout } = useAuth();
   const { clinicInfo, updateClinicInfo } = useSettings();
 
   // Active tab
@@ -249,49 +238,6 @@ export const AdminPage: React.FC = () => {
             Authorized clinic staff only. Please authenticate with your Google Workspace or authorized clinic email to view appointments and consultation transcripts.
           </p>
         </div>
-
-        {authError && (
-          <div className="bg-rose-50 border border-rose-200 p-4 rounded-2xl text-xs text-rose-900 text-left space-y-2">
-            <div className="flex items-start justify-between gap-2">
-              <div className="flex items-center gap-1.5 font-bold text-rose-700">
-                <AlertCircle className="w-4 h-4 shrink-0" />
-                <span>Google Sign-In Error</span>
-              </div>
-              <button
-                onClick={clearAuthError}
-                className="text-xs text-rose-500 hover:text-rose-800 underline"
-              >
-                Dismiss
-              </button>
-            </div>
-            <p className="text-rose-800 leading-relaxed">{authError}</p>
-            {unauthorizedDomain && (
-              <div className="bg-white/80 p-3 rounded-xl border border-rose-200 space-y-2 mt-2">
-                <p className="font-semibold text-rose-950">Quick Fix for Vercel:</p>
-                <ol className="list-decimal list-inside space-y-1 text-slate-700">
-                  <li>Open <strong>Firebase Console &gt; Authentication &gt; Settings</strong></li>
-                  <li>Scroll to <strong>Authorized domains</strong> and click <strong>Add domain</strong></li>
-                  <li>Add your current Vercel domain:</li>
-                </ol>
-                <div className="flex items-center gap-2 pt-1">
-                  <code className="bg-slate-100 text-slate-800 px-2 py-1 rounded font-mono text-xs flex-1 truncate">
-                    {unauthorizedDomain}
-                  </code>
-                  <button
-                    onClick={() => {
-                      navigator.clipboard.writeText(unauthorizedDomain);
-                      setCopiedDomain(true);
-                      setTimeout(() => setCopiedDomain(false), 2500);
-                    }}
-                    className="px-3 py-1 bg-teal-700 hover:bg-teal-800 text-white font-medium text-xs rounded-lg transition-colors cursor-pointer shrink-0"
-                  >
-                    {copiedDomain ? 'Copied!' : 'Copy Domain'}
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        )}
 
         {currentUser && !isAdmin && (
           <div className="bg-amber-50 border border-amber-200 p-3.5 rounded-xl text-xs text-amber-900 text-left">
