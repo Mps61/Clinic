@@ -1,5 +1,5 @@
 import type { Plugin, ViteDevServer } from 'vite';
-import { apiApp } from './api';
+import { apiApp } from './api.ts';
 
 export function dentalApiPlugin(): Plugin {
   return {
