@@ -10,7 +10,7 @@ export default defineConfig(() => {
     plugins: [react(), tailwindcss(), dentalApiPlugin()],
     resolve: {
       alias: {
-        '@': path.resolve(__dirname, '.'),
+        '@': path.resolve('.'),
       },
     },
     server: {

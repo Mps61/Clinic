@@ -31,6 +31,10 @@ export function getAiClient(): GoogleGenAI {
   });
 }
 
+// Aliases for compatibility
+export const getGeminiApiKey = getApiKey;
+export const getGeminiClient = getAiClient;
+
 // Dynamic proxy so both module-level and request-level calls always get the latest valid key
 export const ai = new Proxy({} as GoogleGenAI, {
   get(_target, prop) {

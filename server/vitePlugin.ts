@@ -1,6 +1,5 @@
 import type { Plugin, ViteDevServer } from 'vite';
 import { apiApp } from './api';
-import { setupGeminiLiveWebSocket } from './geminiLiveBridge';
 
 export function dentalApiPlugin(): Plugin {
   return {
@@ -11,7 +10,13 @@ export function dentalApiPlugin(): Plugin {
       });
 
       if (server.httpServer) {
-        setupGeminiLiveWebSocket(server.httpServer as any);
+        import('./geminiLiveBridge')
+          .then(({ setupGeminiLiveWebSocket }) => {
+            setupGeminiLiveWebSocket(server.httpServer as any);
+          })
+          .catch((err) => {
+            console.warn('Notice loading Gemini Live WebSocket in dev server:', err);
+          });
       }
     },
   };
