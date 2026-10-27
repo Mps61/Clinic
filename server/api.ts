@@ -1,84 +1,56 @@
-import express, { Request, Response, NextFunction } from 'express';
+import express from 'express';
 import {
   generateDentalChatResponse,
   generateDentalSpeech,
   transcribeAudio,
   summarizeConversation,
-  getGeminiApiKey,
+  getApiKey,
   ChatMessage,
 } from './geminiService';
 
 export const apiApp = express();
 
-// Enable JSON body parsing with reasonable size limit
-apiApp.use(express.json({ limit: '15mb' }));
-
-// CORS headers & options handling
-apiApp.use((_req: Request, res: Response, next: NextFunction) => {
+// CORS & Preflight headers for cross-origin or Vercel serverless invocations
+apiApp.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-  if (_req.method === 'OPTIONS') {
+  if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
   next();
 });
 
-// Normalize request URL so routes match both with and without leading '/api'
-// This fixes Vercel serverless rewrites vs Express router prefixing
-apiApp.use((req: Request, _res: Response, next: NextFunction) => {
-  if (req.url.startsWith('/api/')) {
-    req.url = req.url.slice(4); // e.g. /api/chat -> /chat
-  } else if (req.url === '/api') {
-    req.url = '/';
-  }
-  next();
-});
+apiApp.use(express.json({ limit: '15mb' }));
 
-// Safe server-side request logging
-apiApp.use((req: Request, res: Response, next: NextFunction) => {
-  const start = Date.now();
-  const method = req.method;
-  const path = req.path;
-
-  res.on('finish', () => {
-    const duration = Date.now() - start;
-    // Safe logging: method, path, status code, duration (never log headers, body tokens, or secrets)
-    console.log(`[API] ${method} ${path} -> ${res.statusCode} (${duration}ms)`);
-  });
-
-  next();
-});
+const router = express.Router();
 
 /**
- * Health check endpoint:
- * Returns system readiness and whether GEMINI_API_KEY is configured on the server
+ * Health check endpoint - reports API key status
  */
-apiApp.get(['/', '/health'], (_req: Request, res: Response) => {
-  const apiKey = getGeminiApiKey();
+router.get('/health', (_req, res) => {
+  const key = getApiKey();
   res.json({
     status: 'healthy',
     clinic: 'Indian Dental Clinic',
     city: 'Chhindwara',
-    state: 'Madhya Pradesh',
-    geminiConfigured: Boolean(apiKey),
-    voiceModel: 'gemini-3.8-flash-lite-tts (Kore)',
-    liveModel: 'gemini-3.8-live (Kore)',
-    chatModel: 'gemini-3.8-flash',
-    timestamp: new Date().toISOString(),
+    geminiAvailable: Boolean(key),
+    keyConfigured: Boolean(key),
+    keyPrefix: key ? `${key.substring(0, 4)}...${key.substring(key.length - 4)}` : null,
   });
 });
 
 /**
  * Text Chat endpoint
  */
-apiApp.post('/chat', async (req: Request, res: Response) => {
+router.post('/chat', async (req, res) => {
   try {
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) {
-      console.error('[API /chat] GEMINI_API_KEY environment variable is not configured on server.');
-      return res.status(503).json({
-        error: 'Gemini API key is not configured on the server. Please add GEMINI_API_KEY to your Vercel project Environment Variables.',
+    const key = getApiKey();
+    if (!key) {
+      return res.status(500).json({
+        error: 'Gemini API key is not configured.',
+        details:
+          'Please set GEMINI_API_KEY in your Vercel Project Settings > Environment Variables, then redeploy.',
         code: 'MISSING_API_KEY',
       });
     }
@@ -98,28 +70,34 @@ apiApp.post('/chat', async (req: Request, res: Response) => {
       reply: replyText,
       timestamp: new Date().toISOString(),
     });
-  } catch (error: any) {
-    const safeMsg = error instanceof Error ? error.message : String(error);
-    console.error('[API /chat] Error generating chat response:', safeMsg);
-    
+  } catch (error) {
+    console.error('Server /api/chat error:', error);
+    const msg = error instanceof Error ? error.message : String(error);
+    const isKeyError =
+      msg.includes('API_KEY') ||
+      msg.includes('apiKey') ||
+      msg.includes('API key') ||
+      msg.includes('API_KEY_INVALID');
+
     return res.status(500).json({
-      error: 'Failed to generate dental assistant response. Please try again.',
-      details: safeMsg,
+      error: isKeyError
+        ? 'Gemini API key is invalid or unauthorized. Please verify GEMINI_API_KEY in your Vercel Environment Variables.'
+        : 'Failed to generate dental assistant response. Please try again.',
+      details: msg,
+      code: isKeyError ? 'INVALID_API_KEY' : 'GENERATION_ERROR',
     });
   }
 });
 
 /**
- * Voice Call Turn endpoint:
- * Generates both text reply and high-fidelity speech audio (WAV) via Gemini TTS
+ * Voice Call Turn endpoint
  */
-apiApp.post('/voice/turn', async (req: Request, res: Response) => {
+router.post('/voice/turn', async (req, res) => {
   try {
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) {
-      console.error('[API /voice/turn] GEMINI_API_KEY is not configured on server.');
-      return res.status(503).json({
-        error: 'Gemini API key is not configured on the server. Please add GEMINI_API_KEY to your Vercel project Environment Variables.',
+    const key = getApiKey();
+    if (!key) {
+      return res.status(500).json({
+        error: 'Gemini API key is not configured on server.',
         code: 'MISSING_API_KEY',
       });
     }
@@ -136,19 +114,23 @@ apiApp.post('/voice/turn', async (req: Request, res: Response) => {
     ];
 
     const replyText = await generateDentalChatResponse(messages, language);
-    const audioBase64 = await generateDentalSpeech(replyText, language);
+    let audioBase64: string | null = null;
+    try {
+      audioBase64 = await generateDentalSpeech(replyText, language);
+    } catch (ttsErr) {
+      console.warn('TTS speech warning, falling back to text:', ttsErr);
+    }
 
     return res.json({
       reply: replyText,
       audioBase64: audioBase64,
       timestamp: new Date().toISOString(),
     });
-  } catch (error: any) {
-    const safeMsg = error instanceof Error ? error.message : String(error);
-    console.error('[API /voice/turn] Error processing voice turn:', safeMsg);
+  } catch (error) {
+    console.error('Server /api/voice/turn error:', error);
     return res.status(500).json({
       error: 'Failed to process voice turn.',
-      details: safeMsg,
+      details: error instanceof Error ? error.message : String(error),
     });
   }
 });
@@ -156,16 +138,8 @@ apiApp.post('/voice/turn', async (req: Request, res: Response) => {
 /**
  * Transcribe recorded audio snippet
  */
-apiApp.post('/voice/transcribe', async (req: Request, res: Response) => {
+router.post('/voice/transcribe', async (req, res) => {
   try {
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) {
-      return res.status(503).json({
-        error: 'Gemini API key is not configured on the server.',
-        code: 'MISSING_API_KEY',
-      });
-    }
-
     const { audioBase64, mimeType } = req.body;
     if (!audioBase64) {
       return res.status(400).json({ error: 'audioBase64 is required.' });
@@ -173,12 +147,11 @@ apiApp.post('/voice/transcribe', async (req: Request, res: Response) => {
 
     const transcript = await transcribeAudio(audioBase64, mimeType || 'audio/webm');
     return res.json({ transcript });
-  } catch (error: any) {
-    const safeMsg = error instanceof Error ? error.message : String(error);
-    console.error('[API /voice/transcribe] Error transcribing audio:', safeMsg);
+  } catch (error) {
+    console.error('Server /api/voice/transcribe error:', error);
     return res.status(500).json({
       error: 'Failed to transcribe audio.',
-      details: safeMsg,
+      details: error instanceof Error ? error.message : String(error),
     });
   }
 });
@@ -186,16 +159,8 @@ apiApp.post('/voice/transcribe', async (req: Request, res: Response) => {
 /**
  * Summarize transcript for clinic staff intake
  */
-apiApp.post('/summary', async (req: Request, res: Response) => {
+router.post('/summary', async (req, res) => {
   try {
-    const apiKey = getGeminiApiKey();
-    if (!apiKey) {
-      return res.status(503).json({
-        error: 'Gemini API key is not configured on the server.',
-        code: 'MISSING_API_KEY',
-      });
-    }
-
     const { transcript } = req.body;
     if (!transcript) {
       return res.status(400).json({ error: 'Transcript is required.' });
@@ -203,15 +168,18 @@ apiApp.post('/summary', async (req: Request, res: Response) => {
 
     const { summary, enquiryCategory, keyPoints } = await summarizeConversation(transcript);
     return res.json({ summary, enquiryCategory, keyPoints });
-  } catch (error: any) {
-    const safeMsg = error instanceof Error ? error.message : String(error);
-    console.error('[API /summary] Error summarizing conversation:', safeMsg);
+  } catch (error) {
+    console.error('Server /api/summary error:', error);
     return res.status(500).json({
       error: 'Failed to summarize conversation.',
-      details: safeMsg,
     });
   }
 });
 
-// Also export as apiRouter for server.ts
+// Dual mount: handles both /api/... and bare /... routes for seamless Vercel serverless routing
+apiApp.use('/api', router);
+apiApp.use('/', router);
+
+// Export router for server.ts and default export for Vercel
 export const apiRouter = apiApp;
+export default apiApp;

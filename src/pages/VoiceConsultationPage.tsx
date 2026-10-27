@@ -26,6 +26,7 @@ import { ToothIcon } from '../components/icons/ToothIcon';
 import { useSettings } from '../context/SettingsContext';
 import { createConversationRecord } from '../firebase/firestoreService';
 import { float32ToInt16Base64, GaplessPCMPlayer } from '../utils/audioStreamer';
+import { canUseClientGemini, generateDentalChatClientFallback } from '../utils/geminiClientFallback';
 
 interface VoiceConsultationPageProps {
   onBack: () => void;
@@ -83,13 +84,6 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [showAllTranscripts, setShowAllTranscripts] = useState(false);
 
-  // Dual-Engine Voice Mode ('realtime' Live WebSocket on dev/server.ts, 'cloud-turn' on Vercel)
-  const [voiceMode, setVoiceMode] = useState<'realtime' | 'cloud-turn'>('realtime');
-  const voiceModeRef = useRef<'realtime' | 'cloud-turn'>('realtime');
-  const [callErrorMessage, setCallErrorMessage] = useState<string | null>(null);
-  const speechRecognitionRef = useRef<any>(null);
-  const greetingTriggeredRef = useRef<boolean>(false);
-
   // Hardware & Live WebSocket Refs
   const wsRef = useRef<WebSocket | null>(null);
   const playerRef = useRef<GaplessPCMPlayer | null>(null);
@@ -102,6 +96,7 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
   const [audioLevel, setAudioLevel] = useState<number>(0);
   const lastAudioLevelUpdateRef = useRef<number>(0);
   const asstTextBufferRef = useRef<string>('');
+  const speechRecRef = useRef<any>(null);
 
   // Validation
   const isNameValid = fullName.trim().length >= 2;
@@ -136,50 +131,30 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
   }, [callState]);
 
   /**
-   * Start Voice Call (Dual-engine: Real-time Gemini Live WebSocket with automatic Serverless HTTP/TTS fallback)
+   * Start Voice Call (Connects real-time Gemini Live WebSocket with voice Aoede)
    */
-  const handleStartCall = async (options?: { skipMic?: boolean }) => {
+  const handleStartCall = async () => {
     setFormTouched(true);
     if (!isFormValid) {
       setPreCallError('Please provide your full name and a valid 10-digit Indian mobile number.');
       return;
     }
     setPreCallError(null);
-    setCallErrorMessage(null);
-    greetingTriggeredRef.current = false;
 
     try {
-      let stream: MediaStream | null = null;
+      // 1. Request microphone permission
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      mediaStreamRef.current = stream;
 
-      // 1. Request microphone permission unless user specifically requested skipMic
-      if (!options?.skipMic) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia({
-            audio: {
-              sampleRate: 16000,
-              channelCount: 1,
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-          });
-          mediaStreamRef.current = stream;
-        } catch (micErr: any) {
-          console.error('[Voice Consultation] Microphone access error:', micErr);
-          let userPrompt = 'Microphone permission is required to speak with our AI dental assistant.';
-          if (micErr?.name === 'NotAllowedError' || micErr?.name === 'PermissionDeniedError') {
-            userPrompt = 'Microphone permission was denied. Please allow microphone access in your browser address bar.';
-          } else if (micErr?.name === 'NotFoundError' || micErr?.name === 'DevicesNotFoundError') {
-            userPrompt = 'No microphone device was detected. You can still continue using the keypad topic prompts below.';
-          } else if (window.location.protocol !== 'https:' && window.location.hostname !== 'localhost') {
-            userPrompt = 'Microphone access requires a secure connection (HTTPS).';
-          }
-          setPreCallError(userPrompt);
-          return;
-        }
-      }
-
-      // 2. Initialize Gapless PCM / WAV Player (24kHz output)
+      // 2. Initialize Gapless PCM Player (24kHz output for Gemini Live)
       const player = new GaplessPCMPlayer();
       player.init();
       player.onAudioLevel = (level) => {
@@ -191,6 +166,12 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
         setVoiceStatus((prev) => (prev === 'speaking' ? prev : 'speaking'));
       };
       playerRef.current = player;
+
+      // 3. Connect to server-side Gemini Live WebSocket bridge
+      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+      const wsUrl = `${protocol}//${window.location.host}/live`;
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
       isCallActiveRef.current = true;
       setCallSeconds(0);
@@ -210,291 +191,215 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
       setTranscripts([initialTurn]);
       setCurrentSubtitle(welcome);
 
-      // Helper: Activate Resilient Cloud Voice Engine (Optimized for Vercel / serverless environments)
-      const activateCloudVoiceMode = () => {
-        if (voiceModeRef.current === 'cloud-turn') return;
-        console.log('[Voice Engine] Activating Cloud Voice Mode (Vercel serverless compatible)');
-        setVoiceMode('cloud-turn');
-        voiceModeRef.current = 'cloud-turn';
-
-        // Trigger welcome greeting via TTS turn if not already spoken
-        if (!greetingTriggeredRef.current) {
-          greetingTriggeredRef.current = true;
-          handleHttpVoiceFallback(
-            language === 'hi'
-              ? 'कृपया नए मरीज़ का स्वागत करें और पूछें कि वह किस दंत समस्या या अपॉइंटमेंट के बारे में जानना चाहते हैं।'
-              : 'Greet the patient warmly to Indian Dental Clinic and ask how you can help them with dental care or appointments today.',
-            true
-          );
-        }
-
-        // Initialize continuous browser SpeechRecognition in Cloud Voice mode
-        startBrowserSpeechRecognition();
+      ws.onopen = () => {
+        // Send initial greeting prompt so the Live model greets back immediately
+        ws.send(JSON.stringify({
+          type: 'text',
+          text: `Greet the patient warmly: "${welcome}"`,
+        }));
       };
 
-      // 3. Connect to server-side Gemini Live WebSocket bridge
-      const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${protocol}//${window.location.host}/live`;
+      ws.onmessage = (event) => {
+        if (!isCallActiveRef.current) return;
+        try {
+          const msg = JSON.parse(event.data);
 
-      let wsEstablished = false;
-      try {
-        const ws = new WebSocket(wsUrl);
-        wsRef.current = ws;
-
-        // If WebSocket doesn't connect within 1500ms (typical for Vercel where WebSockets aren't supported), fallback
-        const wsTimeout = window.setTimeout(() => {
-          if (!wsEstablished && isCallActiveRef.current) {
-            console.log('[Voice Engine] WebSocket connect timeout -> switching to Cloud Voice mode');
-            activateCloudVoiceMode();
+          if (msg.type === 'audio' && msg.audio) {
+            // Live real-time audio chunk from Gemini Live (Aoede)
+            if (!isSpeakerMuted) {
+              playerRef.current?.playChunk(msg.audio);
+            }
           }
-        }, 1500);
 
-        ws.onopen = () => {
-          wsEstablished = true;
-          window.clearTimeout(wsTimeout);
-          setVoiceMode('realtime');
-          voiceModeRef.current = 'realtime';
-          greetingTriggeredRef.current = true;
+          // User speaking transcription (from Gemini Live input audio transcription)
+          if (msg.type === 'user_interim_text' && msg.text) {
+            const clean = msg.text.trim();
+            if (clean) {
+              setCurrentSubtitle(clean);
+              setVoiceStatus('listening');
+            }
+          }
 
-          // Send initial greeting prompt so the Live model greets back immediately
+          if (msg.type === 'user_final_text' && msg.text) {
+            const clean = msg.text.trim();
+            if (clean) {
+              setCurrentSubtitle(clean);
+              setVoiceStatus('processing');
+              setTranscripts((prev) => [
+                ...prev,
+                {
+                  id: `turn_${Date.now()}_u`,
+                  speaker: 'user',
+                  text: clean,
+                  timeStr: formatTime(callSeconds),
+                  seconds: callSeconds,
+                },
+              ]);
+            }
+          }
+
+          // Assistant speaking transcription (from Gemini Live output audio transcription)
+          if (msg.type === 'text' && msg.text) {
+            asstTextBufferRef.current += msg.text;
+            const fullText = asstTextBufferRef.current.trim();
+            if (fullText) {
+              setCurrentSubtitle(fullText);
+              setVoiceStatus('speaking');
+              setTranscripts((prev) => {
+                const last = prev[prev.length - 1];
+                if (last && last.speaker === 'assistant') {
+                  return [...prev.slice(0, -1), { ...last, text: fullText }];
+                } else {
+                  return [
+                    ...prev,
+                    {
+                      id: `turn_${Date.now()}_a`,
+                      speaker: 'assistant',
+                      text: fullText,
+                      timeStr: formatTime(callSeconds),
+                      seconds: callSeconds,
+                    },
+                  ];
+                }
+              });
+            }
+          }
+
+          if (msg.type === 'interrupted') {
+            playerRef.current?.interrupt();
+            asstTextBufferRef.current = '';
+            setVoiceStatus('listening');
+          }
+
+          if (msg.type === 'turn_complete') {
+            asstTextBufferRef.current = '';
+            setVoiceStatus('listening');
+          }
+        } catch (e) {
+          console.error('Error handling live message:', e);
+        }
+      };
+
+      const startSpeechRecognitionFallback = () => {
+        const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+        if (!SpeechRec || !isCallActiveRef.current) return;
+        try {
+          if (speechRecRef.current) {
+            speechRecRef.current.abort();
+          }
+          const recognition = new SpeechRec();
+          recognition.continuous = true;
+          recognition.interimResults = true;
+          recognition.lang = language === 'hi' ? 'hi-IN' : 'en-IN';
+
+          recognition.onresult = (event: any) => {
+            if (!isCallActiveRef.current || isMutedRef.current) return;
+            let finalTranscript = '';
+            for (let i = event.resultIndex; i < event.results.length; ++i) {
+              if (event.results[i].isFinal) {
+                finalTranscript += event.results[i][0].transcript;
+              } else {
+                const interim = event.results[i][0].transcript;
+                if (interim.trim()) {
+                  setCurrentSubtitle(interim);
+                  setVoiceStatus('listening');
+                }
+              }
+            }
+            if (finalTranscript.trim()) {
+              handleUserSpeechCompleted(finalTranscript.trim());
+            }
+          };
+
+          recognition.onerror = (e: any) => {
+            console.warn('SpeechRecognition notice:', e);
+          };
+
+          recognition.onend = () => {
+            if (isCallActiveRef.current && (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN)) {
+              try {
+                recognition.start();
+              } catch {}
+            }
+          };
+
+          recognition.start();
+          speechRecRef.current = recognition;
+        } catch (e) {
+          console.warn('Could not start SpeechRecognition fallback:', e);
+        }
+      };
+
+      ws.onerror = (err) => {
+        console.warn('Gemini Live WebSocket notice (using fallback):', err);
+        startSpeechRecognitionFallback();
+      };
+
+      ws.onclose = () => {
+        console.log('Gemini Live WebSocket closed (using fallback)');
+        startSpeechRecognitionFallback();
+      };
+
+      // 4. Setup AudioContext for continuous 16kHz PCM streaming (no mic cycling)
+      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
+      const inputCtx = new AudioCtxClass({ sampleRate: 16000 });
+      inputAudioCtxRef.current = inputCtx;
+      const micSource = inputCtx.createMediaStreamSource(stream);
+      const processor = inputCtx.createScriptProcessor(2048, 1, 1);
+      processorNodeRef.current = processor;
+
+      processor.onaudioprocess = (e) => {
+        if (!isCallActiveRef.current) return;
+
+        // If user muted microphone in UI, don't stream audio and reset visualizer
+        if (isMutedRef.current) {
+          setAudioLevel(0);
+          return;
+        }
+
+        const inputData = e.inputBuffer.getChannelData(0);
+
+        // Compute local mic audio level for visualizer
+        let sum = 0;
+        for (let i = 0; i < inputData.length; i++) {
+          sum += Math.abs(inputData[i]);
+        }
+        const level = (sum / inputData.length) * 100;
+        const now = Date.now();
+        if (now - lastAudioLevelUpdateRef.current > 60) {
+          lastAudioLevelUpdateRef.current = now;
+          setAudioLevel(level);
+        }
+        if (level > 2) {
+          setVoiceStatus((prev) => (prev === 'speaking' ? prev : 'listening'));
+        }
+
+        // Stream raw PCM chunk to Gemini Live over WebSocket
+        if (ws.readyState === WebSocket.OPEN) {
+          const base64Audio = float32ToInt16Base64(inputData);
           ws.send(JSON.stringify({
-            type: 'text',
-            text: `Greet the patient warmly: "${welcome}"`,
+            type: 'audio',
+            audio: base64Audio,
           }));
-        };
+        }
+      };
 
-        ws.onmessage = (event) => {
-          if (!isCallActiveRef.current) return;
-          try {
-            const msg = JSON.parse(event.data);
-
-            if (msg.type === 'ready') {
-              wsEstablished = true;
-              window.clearTimeout(wsTimeout);
-            }
-
-            if (msg.type === 'audio' && msg.audio) {
-              if (!isSpeakerMuted) {
-                playerRef.current?.playChunk(msg.audio);
-              }
-            }
-
-            if (msg.type === 'user_interim_text' && msg.text) {
-              const clean = msg.text.trim();
-              if (clean) {
-                setCurrentSubtitle(clean);
-                setVoiceStatus('listening');
-              }
-            }
-
-            if (msg.type === 'user_final_text' && msg.text) {
-              const clean = msg.text.trim();
-              if (clean) {
-                setCurrentSubtitle(clean);
-                setVoiceStatus('processing');
-                setTranscripts((prev) => [
-                  ...prev,
-                  {
-                    id: `turn_${Date.now()}_u`,
-                    speaker: 'user',
-                    text: clean,
-                    timeStr: formatTime(callSeconds),
-                    seconds: callSeconds,
-                  },
-                ]);
-              }
-            }
-
-            if (msg.type === 'text' && msg.text) {
-              asstTextBufferRef.current += msg.text;
-              const fullText = asstTextBufferRef.current.trim();
-              if (fullText) {
-                setCurrentSubtitle(fullText);
-                setVoiceStatus('speaking');
-                setTranscripts((prev) => {
-                  const last = prev[prev.length - 1];
-                  if (last && last.speaker === 'assistant') {
-                    return [...prev.slice(0, -1), { ...last, text: fullText }];
-                  } else {
-                    return [
-                      ...prev,
-                      {
-                        id: `turn_${Date.now()}_a`,
-                        speaker: 'assistant',
-                        text: fullText,
-                        timeStr: formatTime(callSeconds),
-                        seconds: callSeconds,
-                      },
-                    ];
-                  }
-                });
-              }
-            }
-
-            if (msg.type === 'interrupted') {
-              playerRef.current?.interrupt();
-              asstTextBufferRef.current = '';
-              setVoiceStatus('listening');
-            }
-
-            if (msg.type === 'turn_complete') {
-              asstTextBufferRef.current = '';
-              setVoiceStatus('listening');
-            }
-
-            if (msg.type === 'error') {
-              console.warn('[Gemini Live] Received server error, activating Cloud Voice fallback:', msg.error);
-              setCallErrorMessage(msg.error);
-              activateCloudVoiceMode();
-            }
-          } catch (e) {
-            console.error('Error handling live message:', e);
-          }
-        };
-
-        ws.onerror = (err) => {
-          console.warn('[Voice Engine] WebSocket closed/unsupported, activating Cloud Voice fallback:', err);
-          window.clearTimeout(wsTimeout);
-          activateCloudVoiceMode();
-        };
-
-        ws.onclose = () => {
-          console.log('[Voice Engine] WebSocket closed');
-          if (isCallActiveRef.current && voiceModeRef.current !== 'cloud-turn') {
-            activateCloudVoiceMode();
-          }
-        };
-      } catch (wsInitErr) {
-        console.warn('[Voice Engine] WebSocket init error:', wsInitErr);
-        activateCloudVoiceMode();
-      }
-
-      // 4. Setup AudioContext for continuous 16kHz PCM streaming if microphone stream exists
-      if (stream) {
-        const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-        const inputCtx = new AudioCtxClass({ sampleRate: 16000 });
-        inputAudioCtxRef.current = inputCtx;
-        const micSource = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(2048, 1, 1);
-        processorNodeRef.current = processor;
-
-        processor.onaudioprocess = (e) => {
-          if (!isCallActiveRef.current) return;
-
-          if (isMutedRef.current) {
-            setAudioLevel(0);
-            return;
-          }
-
-          const inputData = e.inputBuffer.getChannelData(0);
-
-          // Compute local mic audio level for visualizer
-          let sum = 0;
-          for (let i = 0; i < inputData.length; i++) {
-            sum += Math.abs(inputData[i]);
-          }
-          const level = (sum / inputData.length) * 100;
-          const now = Date.now();
-          if (now - lastAudioLevelUpdateRef.current > 60) {
-            lastAudioLevelUpdateRef.current = now;
-            setAudioLevel(level);
-          }
-          if (level > 2) {
-            setVoiceStatus((prev) => (prev === 'speaking' ? prev : 'listening'));
-          }
-
-          // If WebSocket is open in realtime mode, stream raw PCM chunk to Gemini Live
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && voiceModeRef.current === 'realtime') {
-            const base64Audio = float32ToInt16Base64(inputData);
-            wsRef.current.send(JSON.stringify({
-              type: 'audio',
-              audio: base64Audio,
-            }));
-          }
-        };
-
-        const silenceGain = inputCtx.createGain();
-        silenceGain.gain.value = 0;
-        micSource.connect(processor);
-        processor.connect(silenceGain);
-        silenceGain.connect(inputCtx.destination);
-      }
+      // Route processor to a silenced gain node to keep the pipeline alive without audio feedback
+      const silenceGain = inputCtx.createGain();
+      silenceGain.gain.value = 0;
+      micSource.connect(processor);
+      processor.connect(silenceGain);
+      silenceGain.connect(inputCtx.destination);
 
       setVoiceStatus('listening');
-    } catch (err: any) {
-      console.error('Call initialization error:', err);
-      setPreCallError('Could not start voice session. Please ensure your device supports audio and try again.');
+    } catch (err) {
+      console.error('Microphone error:', err);
+      setPreCallError('Microphone permission is required to speak with our AI dental assistant. Please allow microphone access.');
     }
   };
 
   /**
-   * Continuous Browser Speech Recognition for Cloud Voice Mode (Vercel Serverless)
-   */
-  const startBrowserSpeechRecognition = () => {
-    try {
-      const SpeechRecognitionClass = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (!SpeechRecognitionClass) {
-        console.log('[WebSpeech] Browser SpeechRecognition API not supported, using keypad and audio input');
-        return;
-      }
-
-      if (speechRecognitionRef.current) {
-        try { speechRecognitionRef.current.stop(); } catch {}
-      }
-
-      const recognition = new SpeechRecognitionClass();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = language === 'hi' ? 'hi-IN' : 'en-IN';
-
-      recognition.onresult = (event: any) => {
-        if (!isCallActiveRef.current || isMutedRef.current) return;
-        let interim = '';
-        let final = '';
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            final += event.results[i][0].transcript;
-          } else {
-            interim += event.results[i][0].transcript;
-          }
-        }
-
-        if (interim) {
-          setCurrentSubtitle(interim.trim());
-          setVoiceStatus('listening');
-        }
-
-        if (final && final.trim()) {
-          handleUserSpeechCompleted(final.trim());
-        }
-      };
-
-      recognition.onerror = (event: any) => {
-        if (event.error === 'not-allowed') {
-          setCallErrorMessage('Microphone access blocked. Please allow microphone in browser URL bar.');
-        } else if (event.error !== 'no-speech') {
-          console.warn('[WebSpeech] Recognition notice:', event.error);
-        }
-      };
-
-      recognition.onend = () => {
-        if (isCallActiveRef.current && voiceModeRef.current === 'cloud-turn') {
-          try {
-            recognition.start();
-          } catch {}
-        }
-      };
-
-      recognition.start();
-      speechRecognitionRef.current = recognition;
-    } catch (e) {
-      console.warn('[WebSpeech] Could not start speech recognition:', e);
-    }
-  };
-
-  /**
-   * Process user speech turn into transcript (from topic keypad, speech recognition, or text input)
+   * Process user speech turn into transcript (from topic keypad or text input)
    */
   const handleUserSpeechCompleted = (spokenSentence: string) => {
     if (!isCallActiveRef.current || !spokenSentence.trim()) return;
@@ -513,96 +418,97 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
     setVoiceStatus('processing');
     asstTextBufferRef.current = '';
 
-    // If WebSocket is actively connected, send over WebSocket; otherwise use HTTP voice turn
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN && voiceModeRef.current === 'realtime') {
+    // Send user prompt over WebSocket
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({
         type: 'text',
         text: spokenSentence.trim(),
       }));
     } else {
+      // Fallback via HTTP /api/voice/turn if WebSocket reconnecting
       handleHttpVoiceFallback(spokenSentence.trim());
     }
   };
 
-  /**
-   * HTTP Voice Fallback: Generates response via /api/voice/turn and plays WAV audio via Gemini TTS
-   */
-  const handleHttpVoiceFallback = async (spokenText: string, isGreeting: boolean = false) => {
+  const handleHttpVoiceFallback = async (spokenText: string) => {
     try {
-      setVoiceStatus('processing');
       const historyContext = transcripts.slice(-4).map((t) => ({
         role: t.speaker === 'user' ? ('user' as const) : ('model' as const),
         text: t.text,
       }));
 
-      const res = await fetch('/api/voice/turn', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userText: spokenText,
-          language: language,
-          history: historyContext,
-        }),
-      });
+      let replyText = '';
+      let audioBase64: string | null = null;
 
-      if (!res.ok) {
-        let errDesc = 'Failed to generate voice response';
-        try {
-          const errData = await res.json();
-          if (errData.code === 'MISSING_API_KEY' || errData.error?.includes('GEMINI_API_KEY')) {
-            errDesc = '⚠️ Configuration required: GEMINI_API_KEY is not set on Vercel. Please add GEMINI_API_KEY to your Vercel Environment Variables.';
-          } else if (errData.error) {
-            errDesc = errData.error;
-          }
-        } catch {
-          if (res.status === 404) {
-            errDesc = '⚠️ API route not reachable (HTTP 404). Please ensure vercel.json is deployed.';
+      try {
+        const res = await fetch('/api/voice/turn', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userText: spokenText,
+            language: language,
+            history: historyContext,
+          }),
+        });
+
+        if (res.ok) {
+          const data = await res.json();
+          replyText = data.reply;
+          audioBase64 = data.audioBase64;
+        } else {
+          const errData = await res.json().catch(() => null);
+          if (canUseClientGemini()) {
+            replyText = await generateDentalChatClientFallback(
+              [...historyContext, { role: 'user', text: spokenText }],
+              language
+            );
+          } else {
+            throw new Error(errData?.error || 'Voice API turn failed');
           }
         }
-        setCallErrorMessage(errDesc);
-        setCurrentSubtitle(errDesc);
-        setVoiceStatus('idle');
-        return;
+      } catch (apiErr) {
+        if (canUseClientGemini()) {
+          replyText = await generateDentalChatClientFallback(
+            [...historyContext, { role: 'user', text: spokenText }],
+            language
+          );
+        } else {
+          throw apiErr;
+        }
       }
-
-      const data = await res.json();
-      const replyText = data.reply || 'Namaste! How can I assist with your dental consultation today?';
-      const audioBase64 = data.audioBase64;
 
       setVoiceStatus('speaking');
       setCurrentSubtitle(replyText);
 
-      // Only add to transcript if not already the initial greeting
-      if (!isGreeting || transcripts.length === 0) {
-        const asstTurn: TranscriptTurn = {
-          id: `turn_${Date.now()}_a`,
-          speaker: 'assistant',
-          text: replyText,
-          timeStr: formatTime(callSeconds),
-          seconds: callSeconds,
-        };
-        setTranscripts((prev) => [...prev, asstTurn]);
-      }
+      const asstTurn: TranscriptTurn = {
+        id: `turn_${Date.now()}_a`,
+        speaker: 'assistant',
+        text: replyText,
+        timeStr: formatTime(callSeconds),
+        seconds: callSeconds,
+      };
+      setTranscripts((prev) => [...prev, asstTurn]);
 
-      // Play audio through GaplessPCMPlayer using playWav (with audio wave animation)
       if (audioBase64 && !isSpeakerMuted) {
-        if (playerRef.current) {
-          await playerRef.current.playWav(audioBase64);
-        } else {
-          const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
-          await new Promise<void>((resolve) => {
-            audio.onended = () => resolve();
-            audio.onerror = () => resolve();
-            audio.play().catch(() => resolve());
-          });
-        }
-        setVoiceStatus('listening');
+        const audio = new Audio(`data:audio/wav;base64,${audioBase64}`);
+        audio.onended = () => setVoiceStatus('listening');
+        audio.play().catch(() => setVoiceStatus('listening'));
+      } else if (!isSpeakerMuted && 'speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance(replyText);
+        utterance.lang = language === 'hi' ? 'hi-IN' : 'en-IN';
+        utterance.onend = () => setVoiceStatus('listening');
+        utterance.onerror = () => setVoiceStatus('listening');
+        window.speechSynthesis.speak(utterance);
       } else {
         setTimeout(() => setVoiceStatus('listening'), 2000);
       }
-    } catch (e: any) {
-      console.warn('[Voice Engine] HTTP fallback notice:', e?.message || e);
-      setCallErrorMessage('Could not connect to voice service. Please check your internet connection.');
+    } catch (e) {
+      console.warn('HTTP fallback notice:', e);
+      setCurrentSubtitle(
+        language === 'hi'
+          ? 'असिस्टेंट से कनेक्ट होने में समस्या। कृपया Vercel पर GEMINI_API_KEY चेक करें।'
+          : 'Could not connect to dental assistant. Please check GEMINI_API_KEY in Vercel settings.'
+      );
       setVoiceStatus('listening');
     }
   };
@@ -613,12 +519,12 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
   const handleEndCall = async () => {
     isCallActiveRef.current = false;
 
-    // Stop browser speech recognition
-    if (speechRecognitionRef.current) {
+    // Stop speech recognition fallback if running
+    if (speechRecRef.current) {
       try {
-        speechRecognitionRef.current.stop();
+        speechRecRef.current.abort();
       } catch {}
-      speechRecognitionRef.current = null;
+      speechRecRef.current = null;
     }
 
     // Close WebSocket
@@ -959,7 +865,7 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
           {/* Action CTA Button */}
           <div className="space-y-3 pt-1">
             <button
-              onClick={() => handleStartCall()}
+              onClick={handleStartCall}
               disabled={!isFormValid}
               className={`w-full py-4 px-6 rounded-2xl font-bold text-sm sm:text-base flex items-center justify-center gap-3 transition-all cursor-pointer shadow-md ${
                 isFormValid
@@ -973,17 +879,6 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
               <span>Start Voice Call</span>
               <ChevronRight className="w-5 h-5 ml-1" />
             </button>
-
-            {preCallError && (
-              <button
-                type="button"
-                onClick={() => handleStartCall({ skipMic: true })}
-                className="w-full py-2.5 px-4 rounded-xl border border-teal-600/40 text-teal-700 bg-teal-50/70 hover:bg-teal-100/70 text-xs font-semibold transition-colors cursor-pointer flex items-center justify-center gap-2"
-              >
-                <span>Continue in Keypad & Audio Mode (Listen & Tap)</span>
-                <ChevronRight className="w-4 h-4" />
-              </button>
-            )}
 
             <p className="text-center text-[11px] text-slate-500">
               By continuing, you agree to our{' '}
@@ -1041,17 +936,12 @@ export const VoiceConsultationPage: React.FC<VoiceConsultationPageProps> = ({
             </button>
           </div>
 
-          {/* Connection Status Pill & Notification */}
-          <div className="relative z-10 flex flex-col items-center gap-1.5 my-2">
+          {/* Connection Status Pill */}
+          <div className="relative z-10 flex justify-center my-2">
             <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#0A261E] border border-emerald-800/80 text-[11px] font-bold text-emerald-400 shadow-sm">
               <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-              <span>{voiceMode === 'realtime' ? 'Connected (Live Stream)' : 'Connected (Cloud Voice)'}</span>
+              <span>Connected</span>
             </div>
-            {callErrorMessage && (
-              <div className="px-3 py-1 rounded-lg bg-amber-950/80 border border-amber-600/50 text-amber-200 text-[11px] max-w-sm text-center">
-                {callErrorMessage}
-              </div>
-            )}
           </div>
 
           {/* Central Glowing Animated Dental Voice Orb */}

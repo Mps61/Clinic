@@ -13,6 +13,10 @@ import {
 } from 'lucide-react';
 import { useSettings } from '../../context/SettingsContext';
 import { createConversationRecord } from '../../firebase/firestoreService';
+import {
+  canUseClientGemini,
+  generateDentalChatClientFallback,
+} from '../../utils/geminiClientFallback';
 
 interface AIChatDrawerProps {
   isOpen: boolean;
@@ -85,60 +89,86 @@ export const AIChatDrawer: React.FC<AIChatDrawerProps> = ({
     setIsLoading(true);
 
     try {
-      const response = await fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: [...messages, userMsg].map((m) => ({
-            role: m.role,
-            text: m.text,
-          })),
-          language: language,
-        }),
-      });
+      let replyText = '';
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            messages: [...messages, userMsg].map((m) => ({
+              role: m.role,
+              text: m.text,
+            })),
+            language: language,
+          }),
+        });
 
-      if (!response.ok) {
-        let errMessage = 'Server responded with an error';
-        try {
-          const errData = await response.json();
-          if (errData?.code === 'MISSING_API_KEY' || errData?.error?.includes('GEMINI_API_KEY')) {
-            errMessage = '⚠️ Configuration required: GEMINI_API_KEY is not set in your Vercel project environment variables. Please add GEMINI_API_KEY in Vercel settings and redeploy.';
-          } else if (errData?.error) {
-            errMessage = errData.error;
-          }
-        } catch {
-          // If response body was HTML (e.g. 404 from missing serverless rewrite)
-          if (response.status === 404) {
-            errMessage = '⚠️ API route not reachable (HTTP 404). Please ensure vercel.json rewrite or server API routes are deployed.';
+        if (response.ok) {
+          const data = await response.json();
+          replyText = data.reply;
+        } else {
+          const errData = await response.json().catch(() => null);
+          if (errData?.code === 'MISSING_API_KEY' || errData?.code === 'INVALID_API_KEY') {
+            if (canUseClientGemini()) {
+              replyText = await generateDentalChatClientFallback(
+                [...messages, userMsg],
+                language
+              );
+            } else {
+              throw new Error(
+                errData.details ||
+                'Gemini API key is not configured on Vercel.'
+              );
+            }
           } else {
-            errMessage = `Server error (${response.status}). Please try again in a few moments.`;
+            if (canUseClientGemini()) {
+              replyText = await generateDentalChatClientFallback(
+                [...messages, userMsg],
+                language
+              );
+            } else {
+              throw new Error(errData?.error || 'Server responded with an error');
+            }
           }
         }
-        throw new Error(errMessage);
+      } catch (fetchErr) {
+        if (canUseClientGemini()) {
+          replyText = await generateDentalChatClientFallback(
+            [...messages, userMsg],
+            language
+          );
+        } else {
+          throw fetchErr;
+        }
       }
 
-      const data = await response.json();
       const botMsg: Message = {
         role: 'model',
-        text: data.reply || 'Namaste! How may I assist you with your dental care today?',
+        text: replyText,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, botMsg]);
-    } catch (error: any) {
+    } catch (error) {
       console.error('Chat error:', error);
-      const isMissingKey = error?.message?.includes('GEMINI_API_KEY') || error?.message?.includes('Configuration required');
-      const isRouteError = error?.message?.includes('404');
-      
-      let displayText = 'I apologize, but I encountered a connection issue. Please feel free to ask again or contact our clinic directly.';
-      if (isMissingKey || isRouteError) {
-        displayText = error.message;
-      } else if (error instanceof Error && error.message) {
-        displayText = `Notice: ${error.message}`;
-      }
+      const errMsg = error instanceof Error ? error.message : String(error);
+      const isKeyProblem =
+        errMsg.includes('API_KEY') ||
+        errMsg.includes('apiKey') ||
+        errMsg.includes('API key') ||
+        errMsg.includes('MISSING_API_KEY') ||
+        errMsg.includes('INVALID_API_KEY');
+
+      const userFriendlyNotice = isKeyProblem
+        ? language === 'hi'
+          ? '⚠️ Gemini API Key सेटअप नहीं है। कृपया Vercel के Project Settings > Environment Variables में जाकर GEMINI_API_KEY (या VITE_GEMINI_API_KEY) जोड़ें और प्रोजेक्ट को Redeploy करें।'
+          : '⚠️ Gemini API key is missing or invalid on Vercel. Please add GEMINI_API_KEY (or VITE_GEMINI_API_KEY) in Vercel Project Settings > Environment Variables, and click Redeploy.'
+        : language === 'hi'
+        ? 'माफ़ कीजिए, असिस्टेंट से कनेक्ट होने में समस्या आई। कृपया Vercel पर GEMINI_API_KEY एनवायरनमेंट वेरिएबल चेक करें और पुनः प्रयास करें।'
+        : 'I apologize, but I encountered a connection issue. Please verify that GEMINI_API_KEY is configured in your Vercel environment variables, and try again.';
 
       const errorMsg: Message = {
         role: 'model',
-        text: displayText,
+        text: userFriendlyNotice,
         time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       };
       setMessages((prev) => [...prev, errorMsg]);
