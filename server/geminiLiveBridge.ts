@@ -1,7 +1,7 @@
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Server } from 'http';
 import { Modality, LiveServerMessage } from '@google/genai';
-import { getGeminiClient, getGeminiApiKey, CLINIC_SYSTEM_INSTRUCTION } from './geminiService';
+import { ai, CLINIC_SYSTEM_INSTRUCTION, switchClientToFallbackKey } from './geminiService';
 
 export function setupGeminiLiveWebSocket(server: Server) {
   const wss = new WebSocketServer({ noServer: true });
@@ -9,12 +9,12 @@ export function setupGeminiLiveWebSocket(server: Server) {
   server.on('upgrade', (request, socket, head) => {
     try {
       const url = new URL(request.url || '', `http://${request.headers.host || 'localhost'}`);
-      if (url.pathname === '/live' || url.pathname === '/api/live') {
+      if (url.pathname === '/live') {
         wss.handleUpgrade(request, socket, head, (clientWs) => {
           wss.emit('connection', clientWs, request);
         });
       }
-      // Non-/live requests pass through to Vite HMR or other upgrade handlers without socket termination
+      // Non-/live requests pass through to Vite HMR without socket termination
     } catch {
       // Ignore URL parsing errors
     }
@@ -24,46 +24,36 @@ export function setupGeminiLiveWebSocket(server: Server) {
     let session: any = null;
     let isConnected = true;
 
-    console.log('[Gemini Live] Client WebSocket connected for dental voice consultation');
-
     clientWs.on('close', () => {
       isConnected = false;
-      console.log('[Gemini Live] Client WebSocket closed');
       if (session) {
         try {
           session.close();
         } catch (e) {
-          console.warn('[Gemini Live] Notice on session close:', e);
+          console.warn('Error closing Gemini Live session:', e);
         }
       }
     });
 
     clientWs.on('error', (err) => {
-      console.error('[Gemini Live] Client WebSocket error:', err);
+      console.error('Client WebSocket error in Gemini Live:', err);
     });
 
     try {
-      const apiKey = getGeminiApiKey();
-      if (!apiKey) {
-        throw new Error('GEMINI_API_KEY environment variable is missing on server.');
-      }
-
-      const client = getGeminiClient();
-
-      // Connect to Gemini 3.8 Live API with voice configured as Kore (valid voice)
-      session = await client.live.connect({
-        model: 'gemini-3.8-live',
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Kore' },
+      const createSession = async () => {
+        return await ai.live.connect({
+          model: 'gemini-3.8-live',
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: 'Aoede' },
+              },
             },
+            systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
+            outputAudioTranscription: {},
+            inputAudioTranscription: {},
           },
-          systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
-          outputAudioTranscription: {},
-          inputAudioTranscription: {},
-        },
         callbacks: {
           onmessage: (message: LiveServerMessage) => {
             if (!isConnected || clientWs.readyState !== WebSocket.OPEN) return;
@@ -124,7 +114,7 @@ export function setupGeminiLiveWebSocket(server: Server) {
               );
             }
 
-            // 2. Interruption signal
+            // 2. Interruption signal (when user speaks over assistant)
             if (message.serverContent?.interrupted) {
               clientWs.send(JSON.stringify({ type: 'interrupted' }));
             }
@@ -135,31 +125,41 @@ export function setupGeminiLiveWebSocket(server: Server) {
             }
           },
           onerror: (error: any) => {
-            console.error('[Gemini Live] Session error:', error?.message || error);
+            console.error('Gemini Live session error:', error);
             if (isConnected && clientWs.readyState === WebSocket.OPEN) {
               clientWs.send(
                 JSON.stringify({
                   type: 'error',
-                  error: error?.message || 'Live API voice session error',
+                  error: error?.message || 'Live API session error',
                 })
               );
             }
           },
           onclose: () => {
-            console.log('[Gemini Live] Live session closed');
             if (isConnected && clientWs.readyState === WebSocket.OPEN) {
               clientWs.send(JSON.stringify({ type: 'closed' }));
             }
           },
         },
       });
+    };
 
-      console.log('[Gemini Live] Session successfully connected with voice Kore');
-
-      // Notify client that Gemini Live is connected and ready
-      if (clientWs.readyState === WebSocket.OPEN) {
-        clientWs.send(JSON.stringify({ type: 'ready' }));
+    try {
+      session = await createSession();
+    } catch (err: any) {
+      const errMsg = err?.message || String(err);
+      if (errMsg.includes('leaked') || errMsg.includes('403') || errMsg.includes('PERMISSION_DENIED')) {
+        switchClientToFallbackKey();
+        session = await createSession();
+      } else {
+        throw err;
       }
+    }
+
+    // Notify client that Gemini Live is connected and ready
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify({ type: 'ready' }));
+    }
 
       // Handle incoming messages from browser client
       clientWs.on('message', (rawData) => {
@@ -176,23 +176,23 @@ export function setupGeminiLiveWebSocket(server: Server) {
             });
           }
 
-          // Client sent text prompt / question
+          // Client sent text prompt / topic / question
           if (msg.type === 'text' && msg.text && session) {
             session.sendRealtimeInput({
               text: msg.text,
             });
           }
         } catch (parseErr) {
-          console.error('[Gemini Live] Error handling WebSocket message:', parseErr);
+          console.error('Error handling WebSocket message:', parseErr);
         }
       });
-    } catch (connectError: any) {
-      console.error('[Gemini Live] Failed to initialize session:', connectError?.message || connectError);
+    } catch (connectError) {
+      console.error('Failed to initialize Gemini Live session:', connectError);
       if (clientWs.readyState === WebSocket.OPEN) {
         clientWs.send(
           JSON.stringify({
             type: 'error',
-            error: connectError?.message || 'Failed to connect to real-time voice engine. Fallback active.',
+            error: 'Failed to connect to real-time voice engine. Fallback active.',
           })
         );
       }

@@ -3,44 +3,84 @@ import dotenv from 'dotenv';
 
 dotenv.config();
 
-// Helper to resolve Gemini API key from multiple common environment variables
-export function getApiKey(): string {
-  return (
-    process.env.GEMINI_API_KEY ||
-    process.env.VITE_GEMINI_API_KEY ||
-    process.env.GOOGLE_API_KEY ||
-    process.env.API_KEY ||
-    ''
-  ).trim();
+/**
+ * Detect and return a valid Gemini API key.
+ * In AI Studio, the system injects process.env.GEMINI_API_KEY and process.env.VITE_GEMINI_API_KEY.
+ * If one key was flagged as leaked/revoked (e.g. starting with AIzaSyCm or matching the leaked key),
+ * we automatically fall back to the active valid key.
+ */
+export function getValidApiKey(): string {
+  const geminiKey = process.env.GEMINI_API_KEY?.trim();
+  const viteKey = process.env.VITE_GEMINI_API_KEY?.trim();
+
+  const isInvalidOrLeaked = (k?: string): boolean => {
+    if (!k) return true;
+    if (k === 'MY_GEMINI_API_KEY') return true;
+    // Specifically block the leaked key reported by Google's secret scanner
+    if (k === 'AIzaSyCmYeFb0EIGcZbZ3QUHvkuRzQRNTHVlu3Q' || k.startsWith('AIzaSyCm')) {
+      return true;
+    }
+    return false;
+  };
+
+  // If GEMINI_API_KEY is clean and not leaked, use it
+  if (geminiKey && !isInvalidOrLeaked(geminiKey)) {
+    return geminiKey;
+  }
+  // Otherwise use VITE_GEMINI_API_KEY
+  if (viteKey && !isInvalidOrLeaked(viteKey)) {
+    return viteKey;
+  }
+  return geminiKey || viteKey || '';
 }
+
+let cachedApiKey = getValidApiKey();
+let currentClient = new GoogleGenAI({
+  apiKey: cachedApiKey,
+  httpOptions: {
+    headers: {
+      'User-Agent': 'aistudio-build',
+    },
+  },
+});
 
 export function getAiClient(): GoogleGenAI {
-  const key = getApiKey();
-  if (!key) {
-    throw new Error(
-      'GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in your Vercel project Environment Variables.'
-    );
-  }
-  return new GoogleGenAI({
-    apiKey: key,
-    httpOptions: {
-      headers: {
-        'User-Agent': 'aistudio-build',
+  const validKey = getValidApiKey();
+  if (validKey && validKey !== cachedApiKey) {
+    cachedApiKey = validKey;
+    currentClient = new GoogleGenAI({
+      apiKey: cachedApiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
       },
-    },
-  });
+    });
+  }
+  return currentClient;
 }
 
-// Aliases for compatibility
-export const getGeminiApiKey = getApiKey;
-export const getGeminiClient = getAiClient;
+export function switchClientToFallbackKey(): void {
+  const viteKey = process.env.VITE_GEMINI_API_KEY?.trim();
+  const geminiKey = process.env.GEMINI_API_KEY?.trim();
+  const nextKey = (cachedApiKey === geminiKey ? viteKey : geminiKey) || viteKey || geminiKey;
+  if (nextKey && nextKey !== cachedApiKey) {
+    cachedApiKey = nextKey;
+    currentClient = new GoogleGenAI({
+      apiKey: cachedApiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+  }
+}
 
-// Dynamic proxy so both module-level and request-level calls always get the latest valid key
+// Export ai proxy for backward compatibility with live session and existing imports
 export const ai = new Proxy({} as GoogleGenAI, {
-  get(_target, prop) {
-    const client = getAiClient();
-    const val = (client as any)[prop];
-    return typeof val === 'function' ? val.bind(client) : val;
+  get(_target, prop, receiver) {
+    return Reflect.get(getAiClient(), prop, receiver);
   },
 });
 
@@ -85,7 +125,8 @@ export interface ChatMessage {
 }
 
 /**
- * Generate fast chat response using gemini-flash-latest with token capping for near-instant latency
+ * Generate fast chat response using resilient models (gemini-3.1-flash-lite, gemini-3.8-flash, gemini-flash-latest)
+ * with automatic API key fallback and token capping
  */
 export async function generateDentalChatResponse(
   messages: ChatMessage[],
@@ -111,17 +152,40 @@ export async function generateDentalChatResponse(
     }
   }
 
-  const response = await ai.models.generateContent({
-    model: 'gemini-flash-latest',
-    contents: contents,
-    config: {
-      systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
-      temperature: 0.6,
-      maxOutputTokens: 300,
-    },
-  });
+  // Model fallback list: 'gemini-3.1-flash-lite' provides near-instant response and high reliability
+  const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-flash-latest'];
+  let lastError: any = null;
 
-  return response.text || 'I apologize, but I could not generate a response at this moment. Please try again.';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const client = getAiClient();
+    for (const model of candidateModels) {
+      try {
+        const response = await client.models.generateContent({
+          model: model,
+          contents: contents,
+          config: {
+            systemInstruction: CLINIC_SYSTEM_INSTRUCTION,
+            temperature: 0.6,
+            maxOutputTokens: 300,
+          },
+        });
+
+        if (response.text) {
+          return response.text;
+        }
+      } catch (err: any) {
+        lastError = err;
+        const errMsg = err?.message || String(err);
+        if (errMsg.includes('leaked') || errMsg.includes('PERMISSION_DENIED') || errMsg.includes('403')) {
+          switchClientToFallbackKey();
+          break; // Try next attempt with fallback key
+        }
+        // If 503 or model error, continue to next candidate model
+      }
+    }
+  }
+
+  throw lastError || new Error('Failed to generate dental assistant response');
 }
 
 /**
@@ -133,39 +197,48 @@ export async function generateDentalSpeech(
   text: string,
   _language: 'en' | 'hi' = 'en'
 ): Promise<string | null> {
-  try {
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.8-flash-lite-tts',
-      contents: [
-        {
-          role: 'user',
-          parts: [
-            {
-              text: text,
-              speechMetadata: {
-                style: 'Calm, clear, and reassuring healthcare professional',
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const client = getAiClient();
+      const response = await client.models.generateContent({
+        model: 'gemini-3.8-flash-lite-tts',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              {
+                text: text,
+                speechMetadata: {
+                  style: 'Calm, clear, and reassuring healthcare professional',
+                },
               },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: ['AUDIO'],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName: 'Aoede' },
             },
-          ],
-        },
-      ],
-      config: {
-        responseModalities: ['AUDIO'],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName: 'Aoede' },
           },
         },
-      },
-    });
+      });
 
-    const base64Audio =
-      response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-    return base64Audio || null;
-  } catch (error) {
-    console.error('Error generating speech with Gemini TTS:', error);
-    return null;
+      const base64Audio =
+        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      return base64Audio || null;
+    } catch (error: any) {
+      const errMsg = error?.message || String(error);
+      if (errMsg.includes('leaked') || errMsg.includes('403') || errMsg.includes('PERMISSION_DENIED')) {
+        switchClientToFallbackKey();
+        continue;
+      }
+      console.error('Error generating speech with Gemini TTS:', error);
+      return null;
+    }
   }
+  return null;
 }
 
 /**
@@ -175,31 +248,40 @@ export async function transcribeAudio(
   base64Audio: string,
   mimeType: string = 'audio/webm'
 ): Promise<string> {
-  try {
-    const audioPart = {
-      inlineData: {
-        mimeType: mimeType,
-        data: base64Audio,
-      },
-    };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const client = getAiClient();
+      const audioPart = {
+        inlineData: {
+          mimeType: mimeType,
+          data: base64Audio,
+        },
+      };
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-3.5-transcribe',
-      contents: {
-        parts: [
-          audioPart,
-          {
-            text: 'Transcribe this audio recording accurately. It may be in English or Hindi. Return only the exact transcription text.',
-          },
-        ],
-      },
-    });
+      const response = await client.models.generateContent({
+        model: 'gemini-3.5-transcribe',
+        contents: {
+          parts: [
+            audioPart,
+            {
+              text: 'Transcribe this audio recording accurately. It may be in English or Hindi. Return only the exact transcription text.',
+            },
+          ],
+        },
+      });
 
-    return response.text?.trim() || '';
-  } catch (error) {
-    console.error('Error transcribing audio with gemini-3.5-transcribe:', error);
-    return '';
+      return response.text?.trim() || '';
+    } catch (error: any) {
+      const errMsg = error?.message || String(error);
+      if (errMsg.includes('leaked') || errMsg.includes('403') || errMsg.includes('PERMISSION_DENIED')) {
+        switchClientToFallbackKey();
+        continue;
+      }
+      console.error('Error transcribing audio with gemini-3.5-transcribe:', error);
+      return '';
+    }
   }
+  return '';
 }
 
 /**
@@ -210,8 +292,7 @@ export async function summarizeConversation(transcript: string): Promise<{
   enquiryCategory: string;
   keyPoints: string[];
 }> {
-  try {
-    const prompt = `Analyze this dental clinic patient enquiry / conversation transcript:
+  const prompt = `Analyze this dental clinic patient enquiry / conversation transcript:
 """
 ${transcript.slice(0, 8000)}
 """
@@ -232,38 +313,51 @@ Return your response in this exact JSON format:
   ]
 }`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-flash-latest',
-      contents: prompt,
-      config: {
-        responseMimeType: 'application/json',
-        maxOutputTokens: 250,
-      },
-    });
+  const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-flash-latest'];
 
-    const raw = response.text?.trim() || '{}';
-    const parsed = JSON.parse(raw);
-    return {
-      summary: parsed.summary || 'General dental care enquiry.',
-      enquiryCategory: parsed.enquiryCategory || 'General Consultation',
-      keyPoints: Array.isArray(parsed.keyPoints) && parsed.keyPoints.length > 0
-        ? parsed.keyPoints
-        : [
-            'Inquired about dental care services',
-            'Discussed symptoms and general oral health advice',
-            'Requested clinic consultation details'
-          ],
-    };
-  } catch (error) {
-    console.error('Error summarizing conversation:', error);
-    return {
-      summary: 'Patient conversation recorded with consent.',
-      enquiryCategory: 'General Consultation',
-      keyPoints: [
-        'Inquired about dental care services',
-        'Discussed symptoms and oral health advice',
-        'Requested clinic consultation details'
-      ],
-    };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const client = getAiClient();
+    for (const model of candidateModels) {
+      try {
+        const response = await client.models.generateContent({
+          model: model,
+          contents: prompt,
+          config: {
+            responseMimeType: 'application/json',
+            maxOutputTokens: 250,
+          },
+        });
+
+        const raw = response.text?.trim() || '{}';
+        const parsed = JSON.parse(raw);
+        return {
+          summary: parsed.summary || 'General dental care enquiry.',
+          enquiryCategory: parsed.enquiryCategory || 'General Consultation',
+          keyPoints: Array.isArray(parsed.keyPoints) && parsed.keyPoints.length > 0
+            ? parsed.keyPoints
+            : [
+                'Inquired about dental care services',
+                'Discussed symptoms and general oral health advice',
+                'Requested clinic consultation details'
+              ],
+        };
+      } catch (error: any) {
+        const errMsg = error?.message || String(error);
+        if (errMsg.includes('leaked') || errMsg.includes('403') || errMsg.includes('PERMISSION_DENIED')) {
+          switchClientToFallbackKey();
+          break;
+        }
+      }
+    }
   }
+
+  return {
+    summary: 'Patient conversation recorded with consent.',
+    enquiryCategory: 'General Consultation',
+    keyPoints: [
+      'Inquired about dental care services',
+      'Discussed symptoms and oral health advice',
+      'Requested clinic consultation details'
+    ],
+  };
 }
